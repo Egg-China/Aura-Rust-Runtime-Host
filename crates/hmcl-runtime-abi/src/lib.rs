@@ -89,6 +89,9 @@ pub struct HmclSlice {
 /// length; nonzero capacity requires a non-null pointer. The host allocator that produced the
 /// buffer owns its storage. The receiver must pass the complete value to that exact host table's
 /// matching release callback exactly once and must not read, write, copy, or release it afterward.
+/// If a producer violates the contract by returning a malformed descriptor with
+/// [`HmclStatus::Ok`], the receiver must not dereference it, but still passes the exact unchanged
+/// descriptor to the matching release callback once before reporting the malformed result.
 /// This type deliberately does not implement `Copy` or `Clone` so Rust callers do not duplicate the
 /// ownership token accidentally.
 #[repr(C)]
@@ -197,8 +200,11 @@ opaque_id!(
 ///
 /// `length` is a minimum requested capacity, not an exact size. On [`HmclStatus::Ok`], the callback
 /// replaces `out_buffer` with a valid host-owned buffer having `len == 0` and `capacity >= length`;
-/// the caller must release it through this exact host table's [`HmclReleaseBufferFn`] once. On any
-/// other status, `out_buffer` remains byte-for-byte unchanged and no ownership transfers.
+/// the caller must release it through this exact host table's [`HmclReleaseBufferFn`] once. The
+/// ownership transfer occurs on `Ok` even if the returned descriptor violates those invariants. In
+/// that case, the caller must not dereference it, must release the exact unchanged descriptor once,
+/// and reports the producer contract violation as an invalid result. On any other status,
+/// `out_buffer` remains byte-for-byte unchanged and no ownership transfers.
 ///
 /// `context` must be the context from the same host table. `out_buffer` must be non-null, aligned,
 /// and writable for one [`HmclOwnedBuffer`].
@@ -219,8 +225,12 @@ pub type HmclAllocateFn = unsafe extern "C" fn(
 /// # Safety
 ///
 /// `context` must be the context from the same host table. `buffer` must be non-null, aligned, and
-/// point to a valid buffer returned by that exact table's [`HmclAllocateFn`] which has not already
-/// been consumed.
+/// point to an unconsumed ownership token returned with [`HmclStatus::Ok`] by that table's
+/// [`HmclAllocateFn`] or [`HmclHostInvokeFn`]. For a valid allocation, the caller may initialize
+/// storage and update `len` within `capacity` as specified by [`HmclAllocateFn`]. If the producing
+/// callback returned a malformed descriptor, the release callback must accept and consume that
+/// exact unchanged descriptor; it must not require the caller to dereference invalid data. Callers
+/// must never fabricate descriptors or pass tokens from another callback or table.
 pub type HmclReleaseBufferFn =
     unsafe extern "C" fn(context: *mut c_void, buffer: *mut HmclOwnedBuffer) -> HmclStatus;
 
@@ -245,8 +255,10 @@ pub type HmclLogFn =
 /// host, `operation` and `input` must describe readable bytes for the call, and `out_buffer` must be
 /// non-null, aligned, and writable for one [`HmclOwnedBuffer`]. On [`HmclStatus::Ok`], the callback
 /// replaces it with a valid buffer owned by this exact host table; the caller releases that buffer
-/// through the table's [`HmclReleaseBufferFn`] once. On any other status, `out_buffer` remains
-/// byte-for-byte unchanged and no ownership transfers.
+/// through the table's [`HmclReleaseBufferFn`] once. The ownership transfer occurs on `Ok` even if
+/// the descriptor is malformed. The caller then releases the exact unchanged descriptor without
+/// dereferencing it and reports the producer contract violation as an invalid result. On any other
+/// status, `out_buffer` remains byte-for-byte unchanged and no ownership transfers.
 pub type HmclHostInvokeFn = unsafe extern "C" fn(
     context: *mut c_void,
     plugin: HmclPluginId,

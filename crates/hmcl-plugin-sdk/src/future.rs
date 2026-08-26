@@ -43,8 +43,10 @@ impl CallbackRegistry {
         if registry.closed || registry.entries.len() >= MAX_PENDING_CALLBACKS {
             return Err(Error::new(ErrorCode::Unavailable));
         }
-        let id = registry.next_id;
-        registry.next_id = registry.next_id.checked_add(1).unwrap_or(1);
+        let Some(id) = vacant_id(&registry) else {
+            return Err(Error::new(ErrorCode::Unavailable));
+        };
+        registry.next_id = successor(id);
         let entry = Arc::new(Entry {
             state: Mutex::new(EntryState::Pending),
             changed: Condvar::new(),
@@ -104,6 +106,26 @@ impl CallbackRegistry {
             registry.entries.remove(&id);
         }
     }
+}
+
+fn vacant_id(registry: &RegistryState) -> Option<u64> {
+    let mut candidate = if registry.next_id == 0 {
+        1
+    } else {
+        registry.next_id
+    };
+    // Among `live_count + 1` distinct candidates, at least one is vacant while below capacity.
+    for _ in 0..=registry.entries.len() {
+        if !registry.entries.contains_key(&candidate) {
+            return Some(candidate);
+        }
+        candidate = successor(candidate);
+    }
+    None
+}
+
+fn successor(id: u64) -> u64 {
+    id.checked_add(1).unwrap_or(1)
 }
 
 /// A context-scoped, exactly-once completion capability.
@@ -223,5 +245,32 @@ impl PluginFuture {
 impl Drop for PluginFuture {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_id_rollover_skips_live_low_ids_without_overwriting_entries() {
+        let registry = Arc::new(CallbackRegistry::new());
+        let (first_callback, first_future) = registry.pair().expect("first pair");
+        let (second_callback, second_future) = registry.pair().expect("second pair");
+        assert_eq!((first_callback.id, second_callback.id), (1, 2));
+        registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next_id = u64::MAX;
+
+        let (maximum_callback, maximum_future) = registry.pair().expect("maximum pair");
+        let (wrapped_callback, wrapped_future) = registry.pair().expect("wrapped pair");
+        assert_eq!(maximum_callback.id, u64::MAX);
+        assert_eq!(wrapped_callback.id, 3);
+        assert_eq!(registry.len(), 4);
+
+        drop((first_future, second_future, maximum_future, wrapped_future));
+        assert_eq!(registry.len(), 0);
     }
 }

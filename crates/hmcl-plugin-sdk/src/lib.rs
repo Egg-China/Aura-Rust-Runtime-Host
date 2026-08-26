@@ -224,10 +224,10 @@ impl PluginContext {
         if !status.is_ok() {
             return Err(Error::from_host_status(status));
         }
-        if !output.has_valid_layout() {
+        let owned = HostBuffer::new(table, &self.inner.cleanup_failures, output);
+        if !owned.has_valid_layout() {
             return Err(Error::new(ErrorCode::InvalidResult));
         }
-        let owned = HostBuffer::new(table, &self.inner.cleanup_failures, output);
         let bytes = owned.copy_bytes()?;
         owned.release()?;
         Value::from_wire(&bytes)
@@ -321,16 +321,19 @@ impl PluginContext {
         if !status.is_ok() {
             return Err(Error::from_host_status(status));
         }
-        if !output.satisfies_allocation_request(requested) {
+        let mut owned = HostBuffer::new(table, &self.inner.cleanup_failures, output);
+        if !owned.satisfies_allocation_request(requested) {
             return Err(Error::new(ErrorCode::InvalidResult));
         }
         if !bytes.is_empty() {
             // SAFETY: Successful allocation guarantees at least `requested` writable bytes, and
             // source and host-owned destination do not overlap.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), output.data, bytes.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), owned.buffer_mut().data, bytes.len());
+            }
         }
-        output.len = requested;
-        Ok(output)
+        owned.buffer_mut().len = requested;
+        Ok(owned.into_buffer())
     }
 
     fn deactivate(&self) {
@@ -377,6 +380,28 @@ impl<'a> HostBuffer<'a> {
             cleanup_failures,
             buffer: Some(buffer),
         }
+    }
+
+    fn has_valid_layout(&self) -> bool {
+        self.buffer
+            .as_ref()
+            .expect("owned buffer is present")
+            .has_valid_layout()
+    }
+
+    fn satisfies_allocation_request(&self, requested: u64) -> bool {
+        self.buffer
+            .as_ref()
+            .expect("owned buffer is present")
+            .satisfies_allocation_request(requested)
+    }
+
+    fn buffer_mut(&mut self) -> &mut HmclOwnedBuffer {
+        self.buffer.as_mut().expect("owned buffer is present")
+    }
+
+    fn into_buffer(mut self) -> HmclOwnedBuffer {
+        self.buffer.take().expect("owned buffer is present")
     }
 
     fn copy_bytes(&self) -> Result<Vec<u8>, Error> {
@@ -876,7 +901,7 @@ pub mod __private {
 #[cfg(test)]
 mod host_lifetime_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
@@ -944,6 +969,22 @@ mod host_lifetime_tests {
         calls: AtomicUsize,
     }
 
+    struct MalformedBufferHost {
+        descriptor: (usize, u64, u64),
+        release_status: AtomicI32,
+        releases: Mutex<Vec<(usize, u64, u64)>>,
+    }
+
+    impl MalformedBufferHost {
+        fn new(descriptor: (usize, u64, u64), release_status: HmclStatus) -> Self {
+            Self {
+                descriptor,
+                release_status: AtomicI32::new(release_status.into_raw()),
+                releases: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
     impl BlockingHost {
         fn new() -> Arc<Self> {
             Arc::new(Self {
@@ -1009,6 +1050,78 @@ mod host_lifetime_tests {
         host.record_call();
         host.gate.enter_and_wait();
         HmclStatus::Ok
+    }
+
+    unsafe extern "C" fn malformed_invoke(
+        context: *mut c_void,
+        _plugin: HmclPluginId,
+        _token: HmclCapabilityToken,
+        _operation: HmclSlice,
+        _input: HmclSlice,
+        output: *mut HmclOwnedBuffer,
+    ) -> HmclStatus {
+        let host = unsafe { &*context.cast::<MalformedBufferHost>() };
+        let (data, len, capacity) = host.descriptor;
+        unsafe {
+            output.write(HmclOwnedBuffer {
+                data: std::ptr::with_exposed_provenance_mut(data),
+                len,
+                capacity,
+            });
+        }
+        HmclStatus::Ok
+    }
+
+    unsafe extern "C" fn malformed_allocate(
+        context: *mut c_void,
+        _length: u64,
+        output: *mut HmclOwnedBuffer,
+    ) -> HmclStatus {
+        let host = unsafe { &*context.cast::<MalformedBufferHost>() };
+        let (data, len, capacity) = host.descriptor;
+        unsafe {
+            output.write(HmclOwnedBuffer {
+                data: std::ptr::with_exposed_provenance_mut(data),
+                len,
+                capacity,
+            });
+        }
+        HmclStatus::Ok
+    }
+
+    unsafe extern "C" fn record_malformed_release(
+        context: *mut c_void,
+        buffer: *mut HmclOwnedBuffer,
+    ) -> HmclStatus {
+        let host = unsafe { &*context.cast::<MalformedBufferHost>() };
+        let buffer = unsafe { buffer.read() };
+        host.releases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((buffer.data.addr(), buffer.len, buffer.capacity));
+        HmclStatus::from_raw(host.release_status.load(Ordering::SeqCst))
+    }
+
+    fn malformed_buffer_context(
+        host: &MalformedBufferHost,
+        allocate: bool,
+        invoke: bool,
+    ) -> PluginContext {
+        let table = HmclHostApiV1 {
+            context: std::ptr::from_ref(host).cast_mut().cast(),
+            allocate: allocate.then_some(malformed_allocate),
+            release_buffer: Some(record_malformed_release),
+            invoke: invoke.then_some(malformed_invoke),
+            ..HmclHostApiV1::with_required_prefix()
+        };
+        unsafe {
+            PluginContext::from_raw(
+                &table,
+                HmclPluginId::from_raw(7),
+                HmclCapabilityToken::from_raw(11),
+            )
+            .expect("valid malformed-buffer host")
+        }
     }
 
     fn context(host: &Arc<BlockingHost>, invoke: bool, handles: bool) -> PluginContext {
@@ -1182,5 +1295,51 @@ mod host_lifetime_tests {
             Err(error) => assert_eq!(error.code(), ErrorCode::Unavailable),
             Ok(_) => panic!("late external call was admitted"),
         }
+    }
+
+    #[test]
+    fn malformed_successful_invoke_releases_exact_token_once_before_invalid_result() {
+        let descriptor = (0, 1, 1);
+        let host = MalformedBufferHost::new(descriptor, HmclStatus::HostError);
+        let context = malformed_buffer_context(&host, false, true);
+
+        assert_eq!(
+            context
+                .invoke("malformed", &Value::Null)
+                .expect_err("malformed successful invoke")
+                .code(),
+            ErrorCode::InvalidResult
+        );
+        assert_eq!(
+            host.releases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[descriptor]
+        );
+        assert_eq!(context.cleanup_failures(), 1);
+    }
+
+    #[test]
+    fn malformed_successful_allocate_releases_exact_token_once_before_invalid_result() {
+        let descriptor = (std::ptr::dangling_mut::<u8>().addr(), 0, 2);
+        let host = MalformedBufferHost::new(descriptor, HmclStatus::Ok);
+        let context = malformed_buffer_context(&host, true, false);
+
+        assert_eq!(
+            context
+                .allocate_wire(b"abc")
+                .expect_err("undersized successful allocation")
+                .code(),
+            ErrorCode::InvalidResult
+        );
+        assert_eq!(
+            host.releases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[descriptor]
+        );
+        assert_eq!(context.cleanup_failures(), 0);
     }
 }
