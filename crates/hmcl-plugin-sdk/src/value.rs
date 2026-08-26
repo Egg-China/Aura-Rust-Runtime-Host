@@ -209,9 +209,9 @@ impl Encoder {
                 self.output.push(0x93);
                 self.uint64(handle.object_id);
                 self.uint64(handle.generation);
-                self.string(&handle.type_name, 128)?;
+                self.metadata_string(&handle.type_name, 128)?;
             }
-            Value::Error(error) => self.string(error.code().wire_code(), 128)?,
+            Value::Error(error) => self.metadata_string(error.code().wire_code(), 128)?,
         }
         Ok(())
     }
@@ -232,6 +232,17 @@ impl Encoder {
 
     fn string(&mut self, value: &str, limit: usize) -> Result<(), Error> {
         self.add_content(value.len(), limit)?;
+        self.write_string(value)
+    }
+
+    fn metadata_string(&mut self, value: &str, limit: usize) -> Result<(), Error> {
+        if value.len() > limit {
+            return Err(invalid_argument());
+        }
+        self.write_string(value)
+    }
+
+    fn write_string(&mut self, value: &str) -> Result<(), Error> {
         self.output.push(0xdb);
         self.write_length(value.len())?;
         self.output.extend_from_slice(value.as_bytes());
@@ -352,13 +363,13 @@ impl<'a> Decoder<'a> {
                 self.expect(0x93)?;
                 let object_id = self.uint64()?;
                 let generation = self.uint64()?;
-                let type_name = self.string(128)?;
+                let type_name = self.metadata_string(128)?;
                 HandleValue::new(object_id, generation, type_name)
                     .map(Value::Handle)
                     .map_err(|_| invalid_result())
             }
             TAG_ERROR => {
-                let encoded = self.string(128)?;
+                let encoded = self.metadata_string(128)?;
                 let code = ErrorCode::from_wire(&encoded).ok_or_else(invalid_result)?;
                 Ok(Value::Error(Error::new(code)))
             }
@@ -399,9 +410,26 @@ impl<'a> Decoder<'a> {
     }
 
     fn string(&mut self, limit: usize) -> Result<String, Error> {
+        let length = self.string_length(limit)?;
+        self.add_content(length, limit)?;
+        self.read_string(length)
+    }
+
+    fn metadata_string(&mut self, limit: usize) -> Result<String, Error> {
+        let length = self.string_length(limit)?;
+        self.read_string(length)
+    }
+
+    fn string_length(&mut self, limit: usize) -> Result<usize, Error> {
         self.expect(0xdb)?;
         let length = self.length()?;
-        self.add_content(length, limit)?;
+        if length > limit {
+            return Err(invalid_result());
+        }
+        Ok(length)
+    }
+
+    fn read_string(&mut self, length: usize) -> Result<String, Error> {
         let value = std::str::from_utf8(self.take(length)?).map_err(|_| invalid_result())?;
         Ok(value.to_owned())
     }

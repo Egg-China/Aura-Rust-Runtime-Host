@@ -4,7 +4,7 @@ use hmcl_plugin_sdk::abi::{
 };
 use hmcl_plugin_sdk::{ErrorCode, HandleType, HandleValue, ObjectHandle, PluginContext, Value};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 struct FakeHost {
@@ -145,6 +145,75 @@ fn context(host: &FakeHost) -> PluginContext {
     }
 }
 
+struct AbaHost {
+    slot_id: u64,
+    current_generation: AtomicU64,
+    retained: Mutex<Vec<((u64, u64), bool)>>,
+    released: Mutex<Vec<((u64, u64), bool)>>,
+}
+
+impl AbaHost {
+    fn new(slot_id: u64, generation: u64) -> Self {
+        Self {
+            slot_id,
+            current_generation: AtomicU64::new(generation),
+            retained: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn accepts(&self, handle: (u64, u64)) -> bool {
+        handle.0 == self.slot_id && handle.1 == self.current_generation.load(Ordering::SeqCst)
+    }
+}
+
+unsafe extern "C" fn aba_retain(context: *mut c_void, handle: HmclHandleId) -> HmclStatus {
+    let host = unsafe { &*(context.cast::<AbaHost>()) };
+    let handle = handle.into_parts();
+    let accepted = host.accepts(handle);
+    host.retained
+        .lock()
+        .expect("ABA retained lock")
+        .push((handle, accepted));
+    if accepted {
+        HmclStatus::Ok
+    } else {
+        HmclStatus::HostError
+    }
+}
+
+unsafe extern "C" fn aba_release(context: *mut c_void, handle: HmclHandleId) -> HmclStatus {
+    let host = unsafe { &*(context.cast::<AbaHost>()) };
+    let handle = handle.into_parts();
+    let accepted = host.accepts(handle);
+    host.released
+        .lock()
+        .expect("ABA released lock")
+        .push((handle, accepted));
+    if accepted {
+        HmclStatus::Ok
+    } else {
+        HmclStatus::HostError
+    }
+}
+
+fn aba_context(host: &AbaHost) -> PluginContext {
+    let table = HmclHostApiV1 {
+        context: std::ptr::from_ref(host).cast_mut().cast(),
+        retain_handle: Some(aba_retain),
+        release_handle: Some(aba_release),
+        ..HmclHostApiV1::with_required_prefix()
+    };
+    unsafe {
+        PluginContext::from_raw(
+            &table,
+            HmclPluginId::from_raw(7),
+            HmclCapabilityToken::from_raw(11),
+        )
+        .expect("valid ABA host")
+    }
+}
+
 #[test]
 fn bridge_value_wire_v1_round_trips_every_value_and_preserves_map_order() {
     let values = vec![
@@ -253,6 +322,70 @@ fn bridge_value_rejects_malformed_unknown_and_bounded_payloads() {
 }
 
 #[test]
+fn handle_and_error_metadata_do_not_consume_aggregate_content_budget() {
+    const CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+
+    let value = Value::Array(vec![
+        Value::Bytes(vec![0; CONTENT_LIMIT]),
+        Value::Handle(HandleValue::new(1, 2, "document.node").expect("valid handle")),
+        Value::Error(hmcl_plugin_sdk::Error::new(ErrorCode::PermissionDenied)),
+    ]);
+    let mut wire = value.to_wire().expect("metadata is outside content budget");
+    let decoded = Value::from_wire(&wire).expect("metadata decodes outside content budget");
+    assert_eq!(decoded, value);
+    drop(value);
+
+    assert_eq!(&wire[..3], &[0x92, 0x06, 0xdd]);
+    wire[3..7].copy_from_slice(&4_u32.to_be_bytes());
+    let base_length = wire.len();
+    wire.extend(Value::String("x".into()).to_wire().expect("one-byte wire"));
+    assert_eq!(
+        Value::from_wire(&wire)
+            .expect_err("ordinary string exceeds aggregate budget")
+            .code(),
+        ErrorCode::InvalidResult
+    );
+    wire.truncate(base_length);
+    wire.extend(
+        Value::Map(vec![("x".into(), Value::Null)])
+            .to_wire()
+            .expect("one-byte key wire"),
+    );
+    assert_eq!(
+        Value::from_wire(&wire)
+            .expect_err("map key exceeds aggregate budget")
+            .code(),
+        ErrorCode::InvalidResult
+    );
+    drop(wire);
+
+    let Value::Array(mut values) = decoded else {
+        panic!("decoded boundary value must remain an array");
+    };
+    values.push(Value::String("x".into()));
+    let overflow = Value::Array(values);
+    assert_eq!(
+        overflow
+            .to_wire()
+            .expect_err("ordinary string exceeds aggregate budget")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+    let Value::Array(mut values) = overflow else {
+        unreachable!("ordinary string overflow remains an array");
+    };
+    values.pop();
+    values.push(Value::Map(vec![("x".into(), Value::Null)]));
+    assert_eq!(
+        Value::Array(values)
+            .to_wire()
+            .expect_err("map key exceeds aggregate budget")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+}
+
+#[test]
 fn bridge_value_decoder_rejects_noncanonical_trailing_duplicate_and_direct_limits() {
     assert!(Value::from_wire(&[0x92, 0x00, 0xc0, 0x00]).is_err());
     assert!(Value::from_wire(&[0x92, 0x02, 0x00]).is_err());
@@ -351,6 +484,53 @@ fn handles_enforce_semantics_and_exact_retain_release_ownership() {
             .code(),
         ErrorCode::StaleHandle
     );
+}
+
+#[test]
+fn reused_host_slot_rejects_stale_generation_and_accepts_current_generation() {
+    struct Document;
+    impl HandleType for Document {
+        const TYPE_NAME: &'static str = "document";
+    }
+
+    let host = AbaHost::new(41, 1);
+    let context = aba_context(&host);
+    let old = unsafe {
+        ObjectHandle::<Document>::from_owned(
+            &context,
+            HandleValue::new(41, 1, "document").expect("old handle"),
+        )
+        .expect("adopt old generation")
+    };
+
+    host.current_generation.store(2, Ordering::SeqCst);
+    assert_eq!(
+        old.try_clone()
+            .expect_err("reused slot makes old generation stale")
+            .code(),
+        ErrorCode::StaleHandle
+    );
+    let current = unsafe {
+        ObjectHandle::<Document>::from_owned(
+            &context,
+            HandleValue::new(41, 2, "document").expect("current handle"),
+        )
+        .expect("adopt current generation")
+    };
+    let current_clone = current.try_clone().expect("retain current generation");
+    assert_eq!(
+        host.retained.lock().expect("ABA retained lock").as_slice(),
+        &[((41, 1), false), ((41, 2), true)]
+    );
+
+    drop(current_clone);
+    drop(current);
+    drop(old);
+    assert_eq!(
+        host.released.lock().expect("ABA released lock").as_slice(),
+        &[((41, 2), true), ((41, 2), true), ((41, 1), false)]
+    );
+    assert_eq!(context.cleanup_failures(), 1);
 }
 
 #[test]
