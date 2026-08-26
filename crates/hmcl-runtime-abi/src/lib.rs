@@ -6,6 +6,15 @@
 //! All structures are prefix-versioned. Consumers must check `struct_size` before reading a
 //! field and ignore fields beyond the prefix they understand. Byte buffers are always released
 //! through the allocator table that created them; Rust allocator ownership never crosses the ABI.
+//! ABI v1 supports only 64-bit targets, matching every platform supported by this runtime host.
+//!
+//! Every exported function and callback is a no-unwind boundary. Rust implementations must catch
+//! panics before returning through it, and foreign implementations must catch their language's
+//! exceptions. Allowing a panic, unwind, or foreign exception to cross any ABI call is a contract
+//! violation.
+
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("HMCL runtime ABI v1 supports only 64-bit targets");
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -15,22 +24,53 @@ const TABLE_HEADER_SIZE: usize = 2 * size_of::<u32>();
 /// Version number implemented by the v1 host and plugin tables.
 pub const HMCL_BRIDGE_ABI_V1: u32 = 1;
 
-/// Result codes returned across the runtime ABI boundary.
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HmclStatus {
+/// Frozen number of bytes required for the complete [`HmclHostApiV1`] prefix.
+pub const HMCL_HOST_API_V1_PREFIX_SIZE: u32 = 64;
+
+/// Frozen number of bytes required for the complete [`HmclPluginApiV1`] prefix.
+pub const HMCL_PLUGIN_API_V1_PREFIX_SIZE: u32 = 40;
+
+/// An integer result code returned across the runtime ABI boundary.
+///
+/// This transparent value accepts every possible `i32`, including status codes introduced by a
+/// newer foreign implementation. Consumers compare recognized values with the named constants and
+/// preserve unknown values when forwarding diagnostics.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HmclStatus(i32);
+
+#[allow(non_upper_case_globals)]
+impl HmclStatus {
     /// The operation completed successfully.
-    Ok = 0,
+    pub const Ok: Self = Self(0);
     /// A pointer, identifier, or other argument was invalid.
-    InvalidArgument = 1,
+    pub const InvalidArgument: Self = Self(1);
     /// The requested ABI version is not supported.
-    UnsupportedAbi = 2,
+    pub const UnsupportedAbi: Self = Self(2);
     /// A supplied versioned table or output buffer is shorter than the required prefix.
-    BufferTooSmall = 3,
+    pub const BufferTooSmall: Self = Self(3);
     /// A host-owned operation failed.
-    HostError = 4,
+    pub const HostError: Self = Self(4);
     /// A plugin-owned operation failed.
-    PluginError = 5,
+    pub const PluginError: Self = Self(5);
+
+    /// Preserves any status value received from foreign code.
+    #[must_use]
+    pub const fn from_raw(value: i32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the unchanged integer representation used by the C ABI.
+    #[must_use]
+    pub const fn into_raw(self) -> i32 {
+        self.0
+    }
+
+    /// Returns whether this value is exactly [`Self::Ok`].
+    #[must_use]
+    pub const fn is_ok(self) -> bool {
+        self.0 == Self::Ok.0
+    }
 }
 
 /// A borrowed byte sequence whose storage remains owned by the caller.
@@ -45,9 +85,12 @@ pub struct HmclSlice {
 
 /// A byte buffer allocated by one side of the ABI.
 ///
-/// The allocator that produced the buffer retains allocator ownership. The receiver must pass the
-/// complete value to that allocator's matching release callback exactly once and must not use the
-/// bytes afterward.
+/// A valid buffer always has `len <= capacity`. Zero capacity requires a null pointer and zero
+/// length; nonzero capacity requires a non-null pointer. The host allocator that produced the
+/// buffer owns its storage. The receiver must pass the complete value to that exact host table's
+/// matching release callback exactly once and must not read, write, copy, or release it afterward.
+/// This type deliberately does not implement `Copy` or `Clone` so Rust callers do not duplicate the
+/// ownership token accidentally.
 #[repr(C)]
 #[derive(Debug)]
 pub struct HmclOwnedBuffer {
@@ -57,6 +100,34 @@ pub struct HmclOwnedBuffer {
     pub len: u64,
     /// Number of allocated bytes beginning at `data`.
     pub capacity: u64,
+}
+
+impl HmclOwnedBuffer {
+    /// Canonical valid buffer with no allocation or ownership to release.
+    pub const EMPTY: Self = Self {
+        data: std::ptr::null_mut(),
+        len: 0,
+        capacity: 0,
+    };
+
+    /// Checks the pointer, length, and capacity invariants without dereferencing `data`.
+    #[must_use]
+    pub const fn has_valid_layout(&self) -> bool {
+        if self.capacity == 0 {
+            self.data.is_null() && self.len == 0
+        } else {
+            !self.data.is_null() && self.len <= self.capacity
+        }
+    }
+
+    /// Checks a successful allocation response for a requested minimum capacity.
+    ///
+    /// A host allocator returns zero initialized bytes and capacity greater than or equal to the
+    /// request. The caller initializes bytes and updates `len` before exposing payload data.
+    #[must_use]
+    pub const fn satisfies_allocation_request(&self, requested_capacity: u64) -> bool {
+        self.has_valid_layout() && self.len == 0 && self.capacity >= requested_capacity
+    }
 }
 
 macro_rules! opaque_id {
@@ -103,27 +174,42 @@ opaque_id!(
 
 /// Host callback that allocates a buffer using the host allocator.
 ///
+/// Concurrency and unwinding follow the contract on [`HmclHostApiV1`].
+///
 /// # Safety
 ///
+/// `length` is a minimum requested capacity, not an exact size. On [`HmclStatus::Ok`], the callback
+/// replaces `out_buffer` with a valid host-owned buffer having `len == 0` and `capacity >= length`;
+/// the caller must release it through this exact host table's [`HmclReleaseBufferFn`] once. On any
+/// other status, `out_buffer` remains byte-for-byte unchanged and no ownership transfers.
+///
 /// `context` must be the context from the same host table. `out_buffer` must be non-null, aligned,
-/// and writable for one [`HmclOwnedBuffer`]. A successful result initializes it. The resulting
-/// buffer must be passed to the matching [`HmclReleaseBufferFn`] exactly once.
+/// and writable for one [`HmclOwnedBuffer`].
 pub type HmclAllocateFn = unsafe extern "C" fn(
     context: *mut c_void,
     length: u64,
     out_buffer: *mut HmclOwnedBuffer,
 ) -> HmclStatus;
 
-/// Host callback that releases a host-allocated buffer exactly once.
+/// Host callback that consumes a host-allocated buffer exactly once.
+///
+/// Calling this function transfers the buffer ownership token back to its allocating host before
+/// the call begins. The buffer is consumed regardless of the returned diagnostic status: the
+/// caller must never inspect, use, or retry releasing it after the call. An error reports a release
+/// diagnostic; it does not restore ownership to the caller.
+/// Concurrency and unwinding follow the contract on [`HmclHostApiV1`].
 ///
 /// # Safety
 ///
 /// `context` must be the context from the same host table. `buffer` must be non-null, aligned, and
-/// point to a buffer returned by that table's [`HmclAllocateFn`] which has not already been released.
+/// point to a valid buffer returned by that exact table's [`HmclAllocateFn`] which has not already
+/// been consumed.
 pub type HmclReleaseBufferFn =
     unsafe extern "C" fn(context: *mut c_void, buffer: *mut HmclOwnedBuffer) -> HmclStatus;
 
 /// Host callback that records a UTF-8 diagnostic message.
+///
+/// Concurrency and unwinding follow the contract on [`HmclHostApiV1`].
 ///
 /// # Safety
 ///
@@ -134,12 +220,16 @@ pub type HmclLogFn =
 
 /// Host callback that dispatches a Bridge operation for a plugin capability session.
 ///
+/// Concurrency and unwinding follow the contract on [`HmclHostApiV1`].
+///
 /// # Safety
 ///
 /// `context` must be the context from the same host table. All identifiers must originate from the
 /// host, `operation` and `input` must describe readable bytes for the call, and `out_buffer` must be
-/// non-null, aligned, and writable for one [`HmclOwnedBuffer`]. A successful output is host-owned
-/// and must be released with the matching [`HmclReleaseBufferFn`] exactly once.
+/// non-null, aligned, and writable for one [`HmclOwnedBuffer`]. On [`HmclStatus::Ok`], the callback
+/// replaces it with a valid buffer owned by this exact host table; the caller releases that buffer
+/// through the table's [`HmclReleaseBufferFn`] once. On any other status, `out_buffer` remains
+/// byte-for-byte unchanged and no ownership transfers.
 pub type HmclHostInvokeFn = unsafe extern "C" fn(
     context: *mut c_void,
     plugin: HmclPluginId,
@@ -151,6 +241,8 @@ pub type HmclHostInvokeFn = unsafe extern "C" fn(
 
 /// Host callback that acquires one additional reference to a Bridge handle.
 ///
+/// Concurrency and unwinding follow the contract on [`HmclHostApiV1`].
+///
 /// # Safety
 ///
 /// `context` must be the context from the same host table and `handle` must identify a live handle.
@@ -158,6 +250,8 @@ pub type HmclRetainHandleFn =
     unsafe extern "C" fn(context: *mut c_void, handle: HmclHandleId) -> HmclStatus;
 
 /// Host callback that releases one reference to a Bridge handle.
+///
+/// Concurrency and unwinding follow the contract on [`HmclHostApiV1`].
 ///
 /// # Safety
 ///
@@ -170,6 +264,17 @@ pub type HmclReleaseHandleFn =
 ///
 /// Callback slots are nullable so a producer can explicitly omit an optional service. A consumer
 /// must test a slot before calling it and report an appropriate status when it is absent.
+///
+/// A plugin may use the borrowed table only during the call that receives it. If callbacks or
+/// `context` are needed later, the plugin copies no more than the compatible
+/// [`HMCL_HOST_API_V1_PREFIX_SIZE`] bytes after validating `struct_size` and `abi_version`; it never
+/// retains the table pointer. The host keeps every copied callback and `context` valid until the
+/// plugin's shutdown callback has completed.
+///
+/// Host callbacks may be invoked concurrently from multiple threads and may be reentered from
+/// another ABI callback unless an individual callback contract explicitly says otherwise. Host
+/// implementations provide any synchronization required by their context. No callback may allow a
+/// panic, unwind, or foreign exception to cross its ABI boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct HmclHostApiV1 {
@@ -211,14 +316,23 @@ impl HmclHostApiV1 {
     #[must_use]
     pub const fn with_required_prefix() -> Self {
         Self {
-            struct_size: size_of::<Self>() as u32,
+            struct_size: HMCL_HOST_API_V1_PREFIX_SIZE,
             abi_version: HMCL_BRIDGE_ABI_V1,
             ..Self::EMPTY
         }
     }
 }
 
+const _: () = {
+    assert!(size_of::<HmclHostApiV1>() == HMCL_HOST_API_V1_PREFIX_SIZE as usize);
+    assert!(std::mem::align_of::<HmclHostApiV1>() == 8);
+};
+
 /// Plugin callback that starts one plugin capability session.
+///
+/// Initialization completes before the host admits ordinary plugin invocations for this session.
+/// If the plugin needs host services afterward, it copies only the compatible V1 prefix and does
+/// not retain `host`. Concurrency and unwinding otherwise follow [`HmclPluginApiV1`].
 ///
 /// # Safety
 ///
@@ -234,13 +348,16 @@ pub type HmclPluginInitializeFn = unsafe extern "C" fn(
 
 /// Plugin callback that invokes a named payload operation.
 ///
+/// Concurrency and unwinding follow the contract on [`HmclPluginApiV1`].
+///
 /// # Safety
 ///
 /// `context` must be the context returned in the same plugin table. `operation` and `input` must
 /// describe readable bytes for the duration of the call. `out_buffer` must be non-null, aligned,
-/// and writable for one [`HmclOwnedBuffer`]. The plugin must obtain successful output storage from
-/// the host's [`HmclAllocateFn`]; the host remains its owner and calls the matching
-/// [`HmclReleaseBufferFn`] exactly once.
+/// and writable for one [`HmclOwnedBuffer`]. On [`HmclStatus::Ok`], the plugin replaces it with a
+/// valid buffer obtained from the same host table supplied at initialization. That host remains the
+/// owner and calls its matching [`HmclReleaseBufferFn`] exactly once. On any other status,
+/// `out_buffer` remains byte-for-byte unchanged and no ownership transfers.
 pub type HmclPluginInvokeFn = unsafe extern "C" fn(
     context: *mut c_void,
     operation: HmclSlice,
@@ -251,6 +368,12 @@ pub type HmclPluginInvokeFn = unsafe extern "C" fn(
 
 /// Plugin callback that ends a plugin capability session.
 ///
+/// Before calling this callback, the host stops admitting work for the session, waits for every
+/// in-flight or reentrant plugin callback to return, and ensures every session-owned Bridge handle
+/// reference has been released. The shutdown callback therefore runs after quiescence and is not
+/// concurrent with another callback for the same session. It must release plugin state before
+/// returning and must not unwind or throw across the ABI boundary.
+///
 /// # Safety
 ///
 /// `context` must be the context returned in the same plugin table and `plugin` must identify a
@@ -259,6 +382,15 @@ pub type HmclPluginShutdownFn =
     unsafe extern "C" fn(context: *mut c_void, plugin: HmclPluginId) -> HmclStatus;
 
 /// Version-one services supplied by a Rust plugin payload to the host.
+///
+/// The host may use the borrowed table only during the query call. If it needs the table afterward,
+/// it copies no more than the compatible [`HMCL_PLUGIN_API_V1_PREFIX_SIZE`] bytes and never retains
+/// the table pointer. The plugin keeps copied callbacks and `context` valid from successful query
+/// and initialization until shutdown returns.
+///
+/// Except for initialization and quiesced shutdown, plugin callbacks may run concurrently on
+/// multiple threads and may be reentered through host callbacks. Plugin state must synchronize that
+/// access. No callback may allow a panic, unwind, or foreign exception to cross its ABI boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct HmclPluginApiV1 {
@@ -291,12 +423,17 @@ impl HmclPluginApiV1 {
     #[must_use]
     pub const fn with_required_prefix() -> Self {
         Self {
-            struct_size: size_of::<Self>() as u32,
+            struct_size: HMCL_PLUGIN_API_V1_PREFIX_SIZE,
             abi_version: HMCL_BRIDGE_ABI_V1,
             ..Self::EMPTY
         }
     }
 }
+
+const _: () = {
+    assert!(size_of::<HmclPluginApiV1>() == HMCL_PLUGIN_API_V1_PREFIX_SIZE as usize);
+    assert!(std::mem::align_of::<HmclPluginApiV1>() == 8);
+};
 
 #[derive(Clone, Copy, Debug)]
 struct TableHeader {
@@ -350,14 +487,18 @@ unsafe fn read_table_header(table: *const u8) -> Result<TableHeader, HmclStatus>
 /// The host initializes `out_plugin.struct_size` to its writable capacity and
 /// `out_plugin.abi_version` to the requested version. On success, this reference implementation
 /// installs an empty v1 plugin table. Concrete payload crates can provide callbacks by building on
-/// the same table contract.
+/// the same table contract. Callers may invoke independent queries concurrently or reentrantly.
+/// Each side copies only the compatible frozen V1 prefix if it needs table contents after this call;
+/// neither side retains the other side's table pointer.
 ///
 /// # Safety
 ///
 /// `host` must be non-null, aligned, and readable for its first `u32` and for the complete prefix
 /// advertised by that `struct_size`. `out_plugin` must be non-null, aligned, and readable and
 /// writable under the same staged rule. The two allocations must not overlap. Both pointers must
-/// remain valid for the duration of this call.
+/// remain valid for the duration of this call. The caller initializes output header fields before
+/// entry. This function does not panic or unwind; foreign callers likewise must not throw through
+/// the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hmcl_plugin_query_v1(
     host: *const HmclHostApiV1,
@@ -379,8 +520,8 @@ pub unsafe extern "C" fn hmcl_plugin_query_v1(
         Err(status) => return status,
     };
 
-    if host_header.struct_size < size_of::<HmclHostApiV1>() as u32
-        || output_header.struct_size < size_of::<HmclPluginApiV1>() as u32
+    if host_header.struct_size < HMCL_HOST_API_V1_PREFIX_SIZE
+        || output_header.struct_size < HMCL_PLUGIN_API_V1_PREFIX_SIZE
     {
         return HmclStatus::BufferTooSmall;
     }
