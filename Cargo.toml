@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hmcl-runtime-abi"]
+members = ["crates/hmcl-runtime-abi", "crates/hmcl-plugin-sdk"]
 resolver = "3"
 
 [workspace.package]

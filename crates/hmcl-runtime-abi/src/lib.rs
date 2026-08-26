@@ -499,8 +499,7 @@ unsafe fn read_table_header(table: *const u8) -> Result<TableHeader, HmclStatus>
 /// remain valid for the duration of this call. The caller initializes output header fields before
 /// entry. This function does not panic or unwind; foreign callers likewise must not throw through
 /// the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn hmcl_plugin_query_v1(
+pub unsafe extern "C" fn negotiate_plugin_api_v1(
     host: *const HmclHostApiV1,
     out_plugin: *mut HmclPluginApiV1,
 ) -> HmclStatus {
@@ -535,6 +534,26 @@ pub unsafe extern "C" fn hmcl_plugin_query_v1(
     // entire v1 prefix. Writing one prefix deliberately leaves unknown trailing fields untouched.
     unsafe { out_plugin.write(HmclPluginApiV1::with_required_prefix()) };
     HmclStatus::Ok
+}
+
+/// Exports the reference version-one query entry point for standalone ABI artifacts.
+///
+/// This thin wrapper is available only with the default `reference-query-export` feature. Plugin
+/// SDK dependencies disable that feature so a payload can export its own implementation without a
+/// duplicate C symbol.
+///
+/// # Safety
+///
+/// `host` and `out_plugin` must satisfy the complete staged pointer, capacity, alignment,
+/// lifetime, and non-overlap contract documented by [`negotiate_plugin_api_v1`].
+#[cfg(feature = "reference-query-export")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hmcl_plugin_query_v1(
+    host: *const HmclHostApiV1,
+    out_plugin: *mut HmclPluginApiV1,
+) -> HmclStatus {
+    // SAFETY: This wrapper forwards the caller's unchanged pointers under the same contract.
+    unsafe { negotiate_plugin_api_v1(host, out_plugin) }
 }
 
 #[cfg(test)]
