@@ -31,7 +31,10 @@ impl<T: HandleType> ObjectHandle<T> {
     pub fn from_borrowed(context: &PluginContext, value: HandleValue) -> Result<Self, Error> {
         context.ensure_handle_callbacks()?;
         validate_type::<T>(&value)?;
-        context.retain_handle(HmclHandleId::from_raw(value.object_id()))?;
+        context.retain_handle(HmclHandleId::from_raw(
+            value.object_id(),
+            value.generation(),
+        ))?;
         Ok(Self {
             context: context.clone(),
             value,
@@ -63,7 +66,7 @@ impl<T: HandleType> ObjectHandle<T> {
 
 fn validate_type<T: HandleType>(value: &HandleValue) -> Result<(), Error> {
     if value.type_name() != T::TYPE_NAME {
-        return Err(Error::new(ErrorCode::InvalidArgument));
+        return Err(Error::new(ErrorCode::TypeMismatch));
     }
     Ok(())
 }
@@ -79,11 +82,10 @@ impl<T: HandleType> Debug for ObjectHandle<T> {
 
 impl<T: HandleType> Drop for ObjectHandle<T> {
     fn drop(&mut self) {
-        if self
-            .context
-            .release_handle(HmclHandleId::from_raw(self.value.object_id()))
-            .is_err()
-        {
+        if self.context.release_handle_for_drop(HmclHandleId::from_raw(
+            self.value.object_id(),
+            self.value.generation(),
+        )) {
             self.context.record_cleanup_failure();
         }
     }

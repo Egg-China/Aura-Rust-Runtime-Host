@@ -2,62 +2,80 @@ use crate::abi::HmclStatus;
 use std::fmt::{Display, Formatter};
 
 /// Stable, redacted error categories carried by Bridge Value v1.
-#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ErrorCode {
+pub enum BridgeErrorKind {
     /// An argument or locally constructed value is invalid.
     InvalidArgument = 0,
     /// A foreign result is malformed or violates the wire contract.
     InvalidResult = 1,
     /// The plugin lacks permission for the requested operation.
     PermissionDenied = 2,
-    /// The requested resource does not exist.
-    NotFound = 3,
-    /// A required host service is not available.
-    Unavailable = 4,
     /// A host-managed handle is no longer live.
-    StaleHandle = 5,
+    StaleHandle,
+    /// The expected and actual canonical handle types differ.
+    TypeMismatch,
     /// An asynchronous operation was cancelled.
-    Cancelled = 6,
+    Cancelled,
     /// A callback was completed more than once or otherwise failed.
-    CallbackFailed = 7,
+    CallbackFailed,
+    /// A required host service or bounded SDK resource is unavailable.
+    Unavailable,
     /// An implementation error occurred without exposing private diagnostics.
-    Internal = 8,
+    Internal,
 }
 
-impl ErrorCode {
-    pub(crate) const fn from_wire(value: u8) -> Option<Self> {
+impl BridgeErrorKind {
+    /// Returns the stable lower-case code shared with the Java Bridge contract.
+    #[must_use]
+    pub const fn wire_code(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid-argument",
+            Self::InvalidResult => "invalid-result",
+            Self::PermissionDenied => "permission-denied",
+            Self::StaleHandle => "stale-handle",
+            Self::TypeMismatch => "type-mismatch",
+            Self::Cancelled => "cancelled",
+            Self::CallbackFailed => "callback-failed",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
         match value {
-            0 => Some(Self::InvalidArgument),
-            1 => Some(Self::InvalidResult),
-            2 => Some(Self::PermissionDenied),
-            3 => Some(Self::NotFound),
-            4 => Some(Self::Unavailable),
-            5 => Some(Self::StaleHandle),
-            6 => Some(Self::Cancelled),
-            7 => Some(Self::CallbackFailed),
-            8 => Some(Self::Internal),
+            "invalid-argument" => Some(Self::InvalidArgument),
+            "invalid-result" => Some(Self::InvalidResult),
+            "permission-denied" => Some(Self::PermissionDenied),
+            "stale-handle" => Some(Self::StaleHandle),
+            "type-mismatch" => Some(Self::TypeMismatch),
+            "cancelled" => Some(Self::Cancelled),
+            "callback-failed" => Some(Self::CallbackFailed),
+            "unavailable" => Some(Self::Unavailable),
+            "internal" => Some(Self::Internal),
             _ => None,
         }
     }
 }
 
+/// Backward-compatible SDK name for [`BridgeErrorKind`].
+pub type ErrorCode = BridgeErrorKind;
+
 /// A deliberately redacted SDK error containing only a stable category.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Error {
-    code: ErrorCode,
+    code: BridgeErrorKind,
 }
 
 impl Error {
     /// Creates a redacted error in `code`.
     #[must_use]
-    pub const fn new(code: ErrorCode) -> Self {
+    pub const fn new(code: BridgeErrorKind) -> Self {
         Self { code }
     }
 
     /// Returns the stable category without exposing implementation diagnostics.
     #[must_use]
-    pub const fn code(&self) -> ErrorCode {
+    pub const fn code(&self) -> BridgeErrorKind {
         self.code
     }
 

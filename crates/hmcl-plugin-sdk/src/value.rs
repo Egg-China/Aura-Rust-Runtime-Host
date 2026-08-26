@@ -37,6 +37,8 @@ impl HandleValue {
         let type_name = type_name.into();
         if object_id == 0
             || generation == 0
+            || object_id > i64::MAX as u64
+            || generation > i64::MAX as u64
             || !is_valid_type_name(&type_name)
             || type_name.len() > 128
         {
@@ -113,10 +115,27 @@ impl Value {
 }
 
 fn is_valid_type_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
-        })
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut separator = false;
+    for byte in bytes {
+        if matches!(byte, b'.' | b'-') {
+            if separator {
+                return false;
+            }
+            separator = true;
+        } else if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            separator = false;
+        } else {
+            return false;
+        }
+    }
+    !separator
 }
 
 fn invalid_argument() -> Error {
@@ -192,7 +211,7 @@ impl Encoder {
                 self.uint64(handle.generation);
                 self.string(&handle.type_name, 128)?;
             }
-            Value::Error(error) => self.output.push(error.code() as u8),
+            Value::Error(error) => self.string(error.code().wire_code(), 128)?,
         }
         Ok(())
     }
@@ -339,7 +358,8 @@ impl<'a> Decoder<'a> {
                     .map_err(|_| invalid_result())
             }
             TAG_ERROR => {
-                let code = ErrorCode::from_wire(self.byte()?).ok_or_else(invalid_result)?;
+                let encoded = self.string(128)?;
+                let code = ErrorCode::from_wire(&encoded).ok_or_else(invalid_result)?;
                 Ok(Value::Error(Error::new(code)))
             }
             _ => Err(invalid_result()),

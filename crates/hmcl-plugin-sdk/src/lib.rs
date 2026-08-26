@@ -10,7 +10,7 @@ mod value;
 /// The frozen HMCL runtime ABI used by this SDK.
 pub use hmcl_runtime_abi as abi;
 
-pub use error::{Error, ErrorCode};
+pub use error::{BridgeErrorKind, Error, ErrorCode};
 pub use future::{Callback, PluginFuture};
 pub use handle::{HandleType, ObjectHandle};
 pub use value::{HandleValue, Value};
@@ -20,9 +20,17 @@ use abi::{
     HmclHostApiV1, HmclOwnedBuffer, HmclPluginId, HmclSlice, HmclStatus,
 };
 use future::CallbackRegistry;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+thread_local! {
+    static HOST_LEASE_DEPTHS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Clone, Copy)]
 struct HostTable(HmclHostApiV1);
@@ -34,11 +42,110 @@ unsafe impl Send for HostTable {}
 unsafe impl Sync for HostTable {}
 
 struct ContextInner {
-    host: HostTable,
+    host: HostState,
     plugin: HmclPluginId,
     token: HmclCapabilityToken,
     callbacks: Arc<CallbackRegistry>,
     cleanup_failures: AtomicUsize,
+}
+
+struct HostState {
+    table: HostTable,
+    admission: Mutex<HostAdmission>,
+    quiesced: Condvar,
+}
+
+struct HostAdmission {
+    active: bool,
+    in_flight: usize,
+}
+
+struct HostLease<'a> {
+    host: &'a HostState,
+    thread_bound: PhantomData<Rc<()>>,
+}
+
+impl HostState {
+    fn new(table: HmclHostApiV1) -> Self {
+        Self {
+            table: HostTable(table),
+            admission: Mutex::new(HostAdmission {
+                active: true,
+                in_flight: 0,
+            }),
+            quiesced: Condvar::new(),
+        }
+    }
+
+    fn lease(&self) -> Result<HostLease<'_>, Error> {
+        let key = std::ptr::from_ref(self).addr();
+        let nested = HOST_LEASE_DEPTHS.with(|depths| depths.borrow().contains_key(&key));
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !admission.active && !nested {
+            return Err(Error::new(ErrorCode::Unavailable));
+        }
+        admission.in_flight = admission
+            .in_flight
+            .checked_add(1)
+            .ok_or_else(|| Error::new(ErrorCode::Unavailable))?;
+        drop(admission);
+        HOST_LEASE_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            *depths.entry(key).or_default() += 1;
+        });
+        Ok(HostLease {
+            host: self,
+            thread_bound: PhantomData,
+        })
+    }
+
+    fn deactivate(&self) {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admission.active = false;
+        while admission.in_flight != 0 {
+            admission = self
+                .quiesced
+                .wait(admission)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+impl HostLease<'_> {
+    fn table(&self) -> &HostTable {
+        &self.host.table
+    }
+}
+
+impl Drop for HostLease<'_> {
+    fn drop(&mut self) {
+        let key = std::ptr::from_ref(self.host).addr();
+        HOST_LEASE_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths
+                .get_mut(&key)
+                .expect("a host lease records its thread-local admission");
+            *depth -= 1;
+            if *depth == 0 {
+                depths.remove(&key);
+            }
+        });
+        let mut admission = self
+            .host
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admission.in_flight -= 1;
+        if admission.in_flight == 0 {
+            self.host.quiesced.notify_all();
+        }
+    }
 }
 
 /// Safe access to one copied host API prefix and one plugin capability session.
@@ -66,7 +173,7 @@ impl PluginContext {
     fn from_copied(host: HmclHostApiV1, plugin: HmclPluginId, token: HmclCapabilityToken) -> Self {
         Self {
             inner: Arc::new(ContextInner {
-                host: HostTable(host),
+                host: HostState::new(host),
                 plugin,
                 token,
                 callbacks: Arc::new(CallbackRegistry::new()),
@@ -89,13 +196,13 @@ impl PluginContext {
 
     /// Invokes a synchronous host Bridge operation with a canonical value payload.
     pub fn invoke(&self, operation: &str, input: &Value) -> Result<Value, Error> {
-        let invoke = self
-            .inner
-            .host
+        let lease = self.inner.host.lease()?;
+        let table = lease.table();
+        let invoke = table
             .0
             .invoke
             .ok_or_else(|| Error::new(ErrorCode::Unavailable))?;
-        if self.inner.host.0.release_buffer.is_none() {
+        if table.0.release_buffer.is_none() {
             return Err(Error::new(ErrorCode::Unavailable));
         }
         let input = input.to_wire()?;
@@ -106,7 +213,7 @@ impl PluginContext {
         // identifiers and context originate from this exact host table.
         let status = unsafe {
             invoke(
-                self.inner.host.0.context,
+                table.0.context,
                 self.inner.plugin,
                 self.inner.token,
                 operation,
@@ -120,7 +227,7 @@ impl PluginContext {
         if !output.has_valid_layout() {
             return Err(Error::new(ErrorCode::InvalidResult));
         }
-        let owned = HostBuffer::new(self, output);
+        let owned = HostBuffer::new(table, &self.inner.cleanup_failures, output);
         let bytes = owned.copy_bytes()?;
         owned.release()?;
         Value::from_wire(&bytes)
@@ -128,6 +235,7 @@ impl PluginContext {
 
     /// Creates one context-scoped completion capability and its paired future.
     pub fn callback(&self) -> Result<(Callback, PluginFuture), Error> {
+        let _lease = self.inner.host.lease()?;
         self.inner.callbacks.pair()
     }
 
@@ -146,6 +254,8 @@ impl PluginContext {
     pub(crate) fn ensure_release_handle(&self) -> Result<(), Error> {
         self.inner
             .host
+            .lease()?
+            .table()
             .0
             .release_handle
             .map(|_| ())
@@ -153,39 +263,40 @@ impl PluginContext {
     }
 
     pub(crate) fn ensure_handle_callbacks(&self) -> Result<(), Error> {
-        if self.inner.host.0.retain_handle.is_none() || self.inner.host.0.release_handle.is_none() {
+        let lease = self.inner.host.lease()?;
+        if lease.table().0.retain_handle.is_none() || lease.table().0.release_handle.is_none() {
             return Err(Error::new(ErrorCode::Unavailable));
         }
         Ok(())
     }
 
     pub(crate) fn retain_handle(&self, handle: HmclHandleId) -> Result<(), Error> {
-        let retain = self
-            .inner
-            .host
+        let lease = self.inner.host.lease()?;
+        let table = lease.table();
+        if table.0.release_handle.is_none() {
+            return Err(Error::new(ErrorCode::Unavailable));
+        }
+        let retain = table
             .0
             .retain_handle
             .ok_or_else(|| Error::new(ErrorCode::Unavailable))?;
         // SAFETY: This context and handle originate from the host. The caller is acquiring a
         // reference before constructing an owned SDK wrapper.
-        let status = unsafe { retain(self.inner.host.0.context, handle) };
+        let status = unsafe { retain(table.0.context, handle) };
         handle::retain_status(status)
     }
 
-    pub(crate) fn release_handle(&self, handle: HmclHandleId) -> Result<(), Error> {
-        let release = self
-            .inner
-            .host
-            .0
-            .release_handle
-            .ok_or_else(|| Error::new(ErrorCode::Unavailable))?;
+    pub(crate) fn release_handle_for_drop(&self, handle: HmclHandleId) -> bool {
+        let Ok(lease) = self.inner.host.lease() else {
+            return false;
+        };
+        let table = lease.table();
+        let Some(release) = table.0.release_handle else {
+            return true;
+        };
         // SAFETY: `ObjectHandle` calls this exactly once for the live reference it owns.
-        let status = unsafe { release(self.inner.host.0.context, handle) };
-        if status.is_ok() {
-            Ok(())
-        } else {
-            Err(Error::from_host_status(status))
-        }
+        let status = unsafe { release(table.0.context, handle) };
+        !status.is_ok()
     }
 
     pub(crate) fn record_cleanup_failure(&self) {
@@ -193,20 +304,20 @@ impl PluginContext {
     }
 
     fn allocate_wire(&self, bytes: &[u8]) -> Result<HmclOwnedBuffer, Error> {
-        let allocate = self
-            .inner
-            .host
+        let lease = self.inner.host.lease()?;
+        let table = lease.table();
+        let allocate = table
             .0
             .allocate
             .ok_or_else(|| Error::new(ErrorCode::Unavailable))?;
-        if self.inner.host.0.release_buffer.is_none() {
+        if table.0.release_buffer.is_none() {
             return Err(Error::new(ErrorCode::Unavailable));
         }
         let requested =
             u64::try_from(bytes.len()).map_err(|_| Error::new(ErrorCode::InvalidArgument))?;
         let mut output = HmclOwnedBuffer::EMPTY;
         // SAFETY: The output token is writable and the copied host context remains valid.
-        let status = unsafe { allocate(self.inner.host.0.context, requested, &mut output) };
+        let status = unsafe { allocate(table.0.context, requested, &mut output) };
         if !status.is_ok() {
             return Err(Error::from_host_status(status));
         }
@@ -220,6 +331,11 @@ impl PluginContext {
         }
         output.len = requested;
         Ok(output)
+    }
+
+    fn deactivate(&self) {
+        self.inner.host.deactivate();
+        self.inner.callbacks.close();
     }
 }
 
@@ -245,14 +361,20 @@ fn borrowed_slice(bytes: &[u8]) -> HmclSlice {
 }
 
 struct HostBuffer<'a> {
-    context: &'a PluginContext,
+    table: &'a HostTable,
+    cleanup_failures: &'a AtomicUsize,
     buffer: Option<HmclOwnedBuffer>,
 }
 
 impl<'a> HostBuffer<'a> {
-    fn new(context: &'a PluginContext, buffer: HmclOwnedBuffer) -> Self {
+    fn new(
+        table: &'a HostTable,
+        cleanup_failures: &'a AtomicUsize,
+        buffer: HmclOwnedBuffer,
+    ) -> Self {
         Self {
-            context,
+            table,
+            cleanup_failures,
             buffer: Some(buffer),
         }
     }
@@ -271,15 +393,13 @@ impl<'a> HostBuffer<'a> {
     fn release(mut self) -> Result<(), Error> {
         let mut buffer = self.buffer.take().expect("owned buffer is present");
         let release = self
-            .context
-            .inner
-            .host
+            .table
             .0
             .release_buffer
             .expect("release callback was checked before host invocation");
         // SAFETY: This exact host table allocated `buffer`, and taking the option ensures this is
         // its sole explicit release. Ownership is consumed regardless of diagnostic status.
-        let status = unsafe { release(self.context.inner.host.0.context, &mut buffer) };
+        let status = unsafe { release(self.table.0.context, &mut buffer) };
         if status.is_ok() {
             Ok(())
         } else {
@@ -294,16 +414,14 @@ impl Drop for HostBuffer<'_> {
             return;
         };
         let release = self
-            .context
-            .inner
-            .host
+            .table
             .0
             .release_buffer
             .expect("release callback was checked before host invocation");
         // SAFETY: The option is the unique ownership token and is cleared before this call.
-        let status = unsafe { release(self.context.inner.host.0.context, &mut buffer) };
+        let status = unsafe { release(self.table.0.context, &mut buffer) };
         if !status.is_ok() {
-            self.context.record_cleanup_failure();
+            self.cleanup_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -358,7 +476,7 @@ pub mod __private {
     use super::*;
     use abi::{HmclCallbackId, HmclPluginApiV1};
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Condvar, Mutex, OnceLock};
 
     /// Process-static state backing one macro-exported plugin entry point.
     pub struct PluginRuntime<P: Plugin> {
@@ -368,6 +486,126 @@ pub mod __private {
     struct Session<P: Plugin> {
         plugin: P,
         context: PluginContext,
+        invocations: Arc<InvocationGate>,
+    }
+
+    struct InvocationGate {
+        state: Mutex<InvocationState>,
+        quiesced: Condvar,
+    }
+
+    struct InvocationState {
+        accepting: bool,
+        in_flight: usize,
+    }
+
+    struct InvocationLease<P: Plugin> {
+        session: Option<Arc<Session<P>>>,
+    }
+
+    impl InvocationGate {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(InvocationState {
+                    accepting: true,
+                    in_flight: 0,
+                }),
+                quiesced: Condvar::new(),
+            }
+        }
+
+        fn admit(&self) -> bool {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !state.accepting {
+                return false;
+            }
+            let Some(in_flight) = state.in_flight.checked_add(1) else {
+                return false;
+            };
+            state.in_flight = in_flight;
+            true
+        }
+
+        fn close(&self) {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .accepting = false;
+        }
+
+        fn wait(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            while state.in_flight != 0 {
+                state = self
+                    .quiesced
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+
+        fn leave(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.in_flight -= 1;
+            if state.in_flight == 0 {
+                self.quiesced.notify_all();
+            }
+        }
+    }
+
+    impl<P: Plugin> InvocationLease<P> {
+        fn new(session: Arc<Session<P>>) -> Option<Self> {
+            if !session.invocations.admit() {
+                return None;
+            }
+            Some(Self {
+                session: Some(session),
+            })
+        }
+
+        fn session(&self) -> &Session<P> {
+            self.session
+                .as_deref()
+                .expect("an invocation lease owns its session until drop")
+        }
+    }
+
+    impl<P: Plugin> Drop for InvocationLease<P> {
+        fn drop(&mut self) {
+            let session = self
+                .session
+                .take()
+                .expect("an invocation lease drops its session exactly once");
+            let invocations = Arc::clone(&session.invocations);
+            // Shutdown relies on the final session clone disappearing before the active count.
+            drop(session);
+            invocations.leave();
+        }
+    }
+
+    struct ContextDeactivationGuard {
+        context: PluginContext,
+        armed: bool,
+    }
+
+    impl ContextDeactivationGuard {
+        fn new(context: &PluginContext) -> Self {
+            Self {
+                context: context.clone(),
+                armed: true,
+            }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for ContextDeactivationGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                self.context.deactivate();
+            }
+        }
     }
 
     impl<P: Plugin> Default for PluginRuntime<P> {
@@ -459,6 +697,7 @@ pub mod __private {
         // SAFETY: The complete-prefix check proves this copy reads only advertised bytes.
         let copied_host = unsafe { host.read() };
         let plugin_context = PluginContext::from_copied(copied_host, plugin_id, token);
+        let mut deactivation = ContextDeactivationGuard::new(&plugin_context);
         // SAFETY: `context` came from a process-static `PluginRuntime<P>` in `query_inner`.
         let runtime = unsafe { &*(context.cast::<PluginRuntime<P>>()) };
         if runtime
@@ -483,7 +722,9 @@ pub mod __private {
         *session = Some(Arc::new(Session {
             plugin: implementation,
             context: plugin_context,
+            invocations: Arc::new(InvocationGate::new()),
         }));
+        deactivation.disarm();
         HmclStatus::Ok
     }
 
@@ -533,10 +774,15 @@ pub mod __private {
             .session
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(session) = state.as_ref().map(Arc::clone) else {
+        let Some(invocation) = state
+            .as_ref()
+            .map(Arc::clone)
+            .and_then(InvocationLease::new)
+        else {
             return HmclStatus::PluginError;
         };
         drop(state);
+        let session = invocation.session();
         let value = match session
             .plugin
             .invoke(&session.context, operation, input, callback)
@@ -586,11 +832,25 @@ pub mod __private {
             *state = Some(session);
             return HmclStatus::InvalidArgument;
         }
+        session.invocations.close();
         drop(state);
-        let Ok(mut session) = Arc::try_unwrap(session) else {
-            return HmclStatus::PluginError;
+        session.invocations.wait();
+        let session = match Arc::try_unwrap(session) {
+            Ok(session) => session,
+            Err(session) => {
+                session.context.deactivate();
+                return HmclStatus::PluginError;
+            }
         };
-        if session.plugin.shutdown(&session.context).is_ok() {
+        let Session {
+            mut plugin,
+            context,
+            ..
+        } = session;
+        let shutdown = catch_unwind(AssertUnwindSafe(|| plugin.shutdown(&context)));
+        let dropped = catch_unwind(AssertUnwindSafe(|| drop(plugin)));
+        context.deactivate();
+        if matches!(shutdown, Ok(Ok(()))) && dropped.is_ok() {
             HmclStatus::Ok
         } else {
             HmclStatus::PluginError
@@ -610,5 +870,317 @@ pub mod __private {
         }
         // SAFETY: The callback contract guarantees `len` readable bytes for every valid slice.
         Ok(unsafe { std::slice::from_raw_parts(slice.data, length) })
+    }
+}
+
+#[cfg(test)]
+mod host_lifetime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
+
+    struct CallGate {
+        entered: Mutex<bool>,
+        entered_changed: Condvar,
+        allowed: Mutex<bool>,
+        allowed_changed: Condvar,
+    }
+
+    impl CallGate {
+        fn new() -> Self {
+            Self {
+                entered: Mutex::new(false),
+                entered_changed: Condvar::new(),
+                allowed: Mutex::new(false),
+                allowed_changed: Condvar::new(),
+            }
+        }
+
+        fn enter_and_wait(&self) {
+            *self
+                .entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = true;
+            self.entered_changed.notify_all();
+            let mut allowed = self
+                .allowed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            while !*allowed {
+                allowed = self
+                    .allowed_changed
+                    .wait(allowed)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let mut entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            while !*entered {
+                entered = self
+                    .entered_changed
+                    .wait(entered)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+
+        fn allow(&self) {
+            *self
+                .allowed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = true;
+            self.allowed_changed.notify_all();
+        }
+    }
+
+    struct BlockingHost {
+        gate: CallGate,
+        valid: AtomicBool,
+        calls_after_invalidation: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl BlockingHost {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                gate: CallGate::new(),
+                valid: AtomicBool::new(true),
+                calls_after_invalidation: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn record_call(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.valid.load(Ordering::SeqCst) {
+                self.calls_after_invalidation.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    unsafe extern "C" fn blocking_invoke(
+        context: *mut c_void,
+        _plugin: HmclPluginId,
+        _token: HmclCapabilityToken,
+        _operation: HmclSlice,
+        _input: HmclSlice,
+        output: *mut HmclOwnedBuffer,
+    ) -> HmclStatus {
+        let host = unsafe { &*context.cast::<BlockingHost>() };
+        host.record_call();
+        host.gate.enter_and_wait();
+        let mut wire = Value::Null.to_wire().expect("null wire");
+        let buffer = HmclOwnedBuffer {
+            data: wire.as_mut_ptr(),
+            len: wire.len() as u64,
+            capacity: wire.capacity() as u64,
+        };
+        std::mem::forget(wire);
+        unsafe { output.write(buffer) };
+        HmclStatus::Ok
+    }
+
+    unsafe extern "C" fn release_buffer(
+        _context: *mut c_void,
+        buffer: *mut HmclOwnedBuffer,
+    ) -> HmclStatus {
+        let buffer = unsafe { buffer.read() };
+        if buffer.capacity != 0 {
+            unsafe {
+                drop(Vec::from_raw_parts(
+                    buffer.data,
+                    buffer.len as usize,
+                    buffer.capacity as usize,
+                ));
+            }
+        }
+        HmclStatus::Ok
+    }
+
+    unsafe extern "C" fn blocking_release_handle(
+        context: *mut c_void,
+        _handle: HmclHandleId,
+    ) -> HmclStatus {
+        let host = unsafe { &*context.cast::<BlockingHost>() };
+        host.record_call();
+        host.gate.enter_and_wait();
+        HmclStatus::Ok
+    }
+
+    fn context(host: &Arc<BlockingHost>, invoke: bool, handles: bool) -> PluginContext {
+        let table = HmclHostApiV1 {
+            context: std::ptr::from_ref(host.as_ref()).cast_mut().cast(),
+            release_buffer: invoke.then_some(release_buffer),
+            invoke: invoke.then_some(blocking_invoke),
+            release_handle: handles.then_some(blocking_release_handle),
+            ..HmclHostApiV1::with_required_prefix()
+        };
+        unsafe {
+            PluginContext::from_raw(
+                &table,
+                HmclPluginId::from_raw(7),
+                HmclCapabilityToken::from_raw(11),
+            )
+            .expect("valid host")
+        }
+    }
+
+    #[test]
+    fn deactivation_waits_for_admitted_invoke_and_rejects_late_context_clones() {
+        let host = BlockingHost::new();
+        let context = context(&host, true, false);
+        let (callback, future) = context.callback().expect("callback");
+        let invoke_context = context.clone();
+        let invoke_thread =
+            std::thread::spawn(move || invoke_context.invoke("block", &Value::Null));
+        host.gate.wait_until_entered();
+
+        let deactivate_context = context.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let deactivate_thread = std::thread::spawn(move || {
+            deactivate_context.deactivate();
+            done_tx.send(()).expect("deactivation completion");
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        host.gate.allow();
+        assert_eq!(
+            invoke_thread.join().expect("invoke thread"),
+            Ok(Value::Null)
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deactivation waited for invoke");
+        deactivate_thread.join().expect("deactivation thread");
+
+        host.valid.store(false, Ordering::SeqCst);
+        assert_eq!(
+            context
+                .invoke("late", &Value::Null)
+                .expect_err("inactive")
+                .code(),
+            ErrorCode::Unavailable
+        );
+        assert_eq!(
+            future.wait().expect_err("cancelled").code(),
+            ErrorCode::Cancelled
+        );
+        assert_eq!(
+            callback
+                .complete(Ok(Value::Null))
+                .expect_err("inactive")
+                .code(),
+            ErrorCode::Cancelled
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.calls_after_invalidation.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn deactivation_waits_for_admitted_handle_drop_and_suppresses_late_drop() {
+        struct Document;
+        impl HandleType for Document {
+            const TYPE_NAME: &'static str = "document";
+        }
+
+        let host = BlockingHost::new();
+        let context = context(&host, false, true);
+        let first = unsafe {
+            ObjectHandle::<Document>::from_owned(
+                &context,
+                HandleValue::new(5, 7, "document").expect("handle"),
+            )
+            .expect("owned")
+        };
+        let late = unsafe {
+            ObjectHandle::<Document>::from_owned(
+                &context,
+                HandleValue::new(6, 8, "document").expect("handle"),
+            )
+            .expect("owned")
+        };
+        let drop_thread = std::thread::spawn(move || drop(first));
+        host.gate.wait_until_entered();
+
+        let deactivate_context = context.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let deactivate_thread = std::thread::spawn(move || {
+            deactivate_context.deactivate();
+            done_tx.send(()).expect("deactivation completion");
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        host.gate.allow();
+        drop_thread.join().expect("drop thread");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deactivation waited for release");
+        deactivate_thread.join().expect("deactivation thread");
+
+        host.valid.store(false, Ordering::SeqCst);
+        drop(late);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.calls_after_invalidation.load(Ordering::SeqCst), 0);
+        assert_eq!(context.cleanup_failures(), 0);
+    }
+
+    #[test]
+    fn admitted_thread_can_reenter_after_closing_but_external_calls_are_rejected() {
+        let host = Arc::new(HostState::new(HmclHostApiV1::with_required_prefix()));
+        let worker_host = Arc::clone(&host);
+        let (outer_tx, outer_rx) = mpsc::channel();
+        let (reenter_tx, reenter_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outer = worker_host.lease().expect("outer admission");
+            outer_tx.send(()).expect("outer entered");
+            reenter_rx.recv().expect("reentry signal");
+            let nested = worker_host.lease().map(|_| ());
+            attempt_tx.send(nested).expect("reentry result");
+            drop(outer);
+        });
+        outer_rx.recv().expect("outer admission signal");
+
+        let deactivate_host = Arc::clone(&host);
+        let (done_tx, done_rx) = mpsc::channel();
+        let deactivate = std::thread::spawn(move || {
+            deactivate_host.deactivate();
+            done_tx.send(()).expect("deactivation completion");
+        });
+        let closing_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let active = host
+                .admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .active;
+            if !active {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < closing_deadline,
+                "deactivation did not close admission"
+            );
+            std::thread::yield_now();
+        }
+        reenter_tx.send(()).expect("allow nested admission");
+        assert!(
+            attempt_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("nested admission did not block")
+                .is_ok(),
+            "the already-admitted thread must retain reentrant host access"
+        );
+        worker.join().expect("worker thread");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deactivation waited for nested lease");
+        deactivate.join().expect("deactivation thread");
+        match host.lease() {
+            Err(error) => assert_eq!(error.code(), ErrorCode::Unavailable),
+            Ok(_) => panic!("late external call was admitted"),
+        }
     }
 }

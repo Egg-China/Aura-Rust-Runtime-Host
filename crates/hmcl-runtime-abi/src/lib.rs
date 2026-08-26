@@ -163,10 +163,27 @@ opaque_id!(
     HmclCapabilityToken,
     "Opaque token authorizing operations for one plugin capability session."
 );
-opaque_id!(
-    HmclHandleId,
-    "Opaque identifier for a host-managed Bridge handle."
-);
+/// Generation-safe identifier for one host-managed Bridge handle slot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HmclHandleId {
+    id: u64,
+    generation: u64,
+}
+
+impl HmclHandleId {
+    /// Creates an exact slot and generation identity from its two transport fields.
+    #[must_use]
+    pub const fn from_raw(id: u64, generation: u64) -> Self {
+        Self { id, generation }
+    }
+
+    /// Returns the unchanged slot and generation transport fields.
+    #[must_use]
+    pub const fn into_parts(self) -> (u64, u64) {
+        (self.id, self.generation)
+    }
+}
 opaque_id!(
     HmclCallbackId,
     "Opaque identifier correlating an asynchronous request with its completion."

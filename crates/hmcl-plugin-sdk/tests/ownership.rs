@@ -9,6 +9,7 @@ use std::sync::{Arc, Barrier, Mutex};
 
 struct FakeHost {
     output: Mutex<Vec<u8>>,
+    last_input: Mutex<Vec<u8>>,
     invoke_status: AtomicI32,
     retain_status: AtomicI32,
     release_status: AtomicI32,
@@ -16,12 +17,15 @@ struct FakeHost {
     invokes: AtomicUsize,
     retains: AtomicUsize,
     releases: AtomicUsize,
+    retained_handles: Mutex<Vec<(u64, u64)>>,
+    released_handles: Mutex<Vec<(u64, u64)>>,
 }
 
 impl FakeHost {
     fn new(output: Vec<u8>) -> Self {
         Self {
             output: Mutex::new(output),
+            last_input: Mutex::new(Vec::new()),
             invoke_status: AtomicI32::new(HmclStatus::Ok.into_raw()),
             retain_status: AtomicI32::new(HmclStatus::Ok.into_raw()),
             release_status: AtomicI32::new(HmclStatus::Ok.into_raw()),
@@ -29,6 +33,8 @@ impl FakeHost {
             invokes: AtomicUsize::new(0),
             retains: AtomicUsize::new(0),
             releases: AtomicUsize::new(0),
+            retained_handles: Mutex::new(Vec::new()),
+            released_handles: Mutex::new(Vec::new()),
         }
     }
 }
@@ -77,11 +83,13 @@ unsafe extern "C" fn invoke(
     _plugin: HmclPluginId,
     _token: HmclCapabilityToken,
     _operation: HmclSlice,
-    _input: HmclSlice,
+    input: HmclSlice,
     out: *mut HmclOwnedBuffer,
 ) -> HmclStatus {
     let host = unsafe { &*(context.cast::<FakeHost>()) };
     host.invokes.fetch_add(1, Ordering::SeqCst);
+    let input = unsafe { std::slice::from_raw_parts(input.data, input.len as usize) };
+    *host.last_input.lock().expect("last input lock") = input.to_vec();
     let status = HmclStatus::from_raw(host.invoke_status.load(Ordering::SeqCst));
     if !status.is_ok() {
         return status;
@@ -97,15 +105,23 @@ unsafe extern "C" fn invoke(
     status
 }
 
-unsafe extern "C" fn retain(context: *mut c_void, _handle: HmclHandleId) -> HmclStatus {
+unsafe extern "C" fn retain(context: *mut c_void, handle: HmclHandleId) -> HmclStatus {
     let host = unsafe { &*(context.cast::<FakeHost>()) };
     host.retains.fetch_add(1, Ordering::SeqCst);
+    host.retained_handles
+        .lock()
+        .expect("retained handles lock")
+        .push(handle.into_parts());
     HmclStatus::from_raw(host.retain_status.load(Ordering::SeqCst))
 }
 
-unsafe extern "C" fn release_handle(context: *mut c_void, _handle: HmclHandleId) -> HmclStatus {
+unsafe extern "C" fn release_handle(context: *mut c_void, handle: HmclHandleId) -> HmclStatus {
     let host = unsafe { &*(context.cast::<FakeHost>()) };
     host.releases.fetch_add(1, Ordering::SeqCst);
+    host.released_handles
+        .lock()
+        .expect("released handles lock")
+        .push(handle.into_parts());
     HmclStatus::from_raw(host.release_status.load(Ordering::SeqCst))
 }
 
@@ -157,6 +173,30 @@ fn bridge_value_wire_v1_round_trips_every_value_and_preserves_map_order() {
 }
 
 #[test]
+fn bridge_errors_have_exact_java_parity_wire_codes() {
+    let cases = [
+        (ErrorCode::InvalidArgument, "invalid-argument"),
+        (ErrorCode::InvalidResult, "invalid-result"),
+        (ErrorCode::PermissionDenied, "permission-denied"),
+        (ErrorCode::StaleHandle, "stale-handle"),
+        (ErrorCode::TypeMismatch, "type-mismatch"),
+        (ErrorCode::Cancelled, "cancelled"),
+        (ErrorCode::CallbackFailed, "callback-failed"),
+        (ErrorCode::Unavailable, "unavailable"),
+        (ErrorCode::Internal, "internal"),
+    ];
+    for (kind, code) in cases {
+        assert_eq!(kind.wire_code(), code);
+        let value = Value::Error(hmcl_plugin_sdk::Error::new(kind));
+        let mut expected = vec![0x92, 0x09, 0xdb];
+        expected.extend_from_slice(&(code.len() as u32).to_be_bytes());
+        expected.extend_from_slice(code.as_bytes());
+        assert_eq!(value.to_wire().expect("error wire"), expected);
+        assert_eq!(Value::from_wire(&expected), Ok(value));
+    }
+}
+
+#[test]
 fn bridge_value_rejects_malformed_unknown_and_bounded_payloads() {
     assert_eq!(
         Value::Float(f64::NAN)
@@ -172,7 +212,7 @@ fn bridge_value_rejects_malformed_unknown_and_bounded_payloads() {
         ErrorCode::InvalidResult
     );
     assert_eq!(
-        Value::from_wire(&[0x92, 0x09, 0x7f])
+        Value::from_wire(&[0x92, 0x09, 0xdb, 0, 0, 0, 3, b'b', b'a', b'd'])
             .expect_err("unknown code rejected")
             .code(),
         ErrorCode::InvalidResult
@@ -241,6 +281,19 @@ fn handles_enforce_semantics_and_exact_retain_release_ownership() {
     assert!(HandleValue::new(1, 0, "document").is_err());
     assert!(HandleValue::new(1, 1, "Document").is_err());
     assert!(HandleValue::new(1, 1, "a".repeat(129)).is_err());
+    assert!(HandleValue::new(i64::MAX as u64 + 1, 1, "document").is_err());
+    assert!(HandleValue::new(1, i64::MAX as u64 + 1, "document").is_err());
+    for valid in ["a", "a0", "document.node", "plugin-type", "a.b-c9"] {
+        assert!(HandleValue::new(i64::MAX as u64, i64::MAX as u64, valid).is_ok());
+    }
+    for invalid in [
+        "", "0a", "_a", "a_b", "a..b", "a--b", "a.-b", "a.", "a-", "A", "é",
+    ] {
+        assert!(
+            HandleValue::new(1, 1, invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
 
     struct Document;
     impl HandleType for Document {
@@ -253,6 +306,13 @@ fn handles_enforce_semantics_and_exact_retain_release_ownership() {
         unsafe { ObjectHandle::<Document>::from_owned(&context, value.clone()) }.expect("owned");
     let cloned = owned.try_clone().expect("retained clone");
     assert_eq!(host.retains.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.retained_handles
+            .lock()
+            .expect("retained handles")
+            .as_slice(),
+        &[(9, 3)]
+    );
     drop(cloned);
     drop(owned);
     assert_eq!(host.releases.load(Ordering::SeqCst), 2);
@@ -261,6 +321,26 @@ fn handles_enforce_semantics_and_exact_retain_release_ownership() {
     assert_eq!(host.retains.load(Ordering::SeqCst), 2);
     drop(borrowed);
     assert_eq!(host.releases.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        host.released_handles
+            .lock()
+            .expect("released handles")
+            .as_slice(),
+        &[(9, 3), (9, 3), (9, 3)]
+    );
+
+    struct Other;
+    impl HandleType for Other {
+        const TYPE_NAME: &'static str = "other";
+    }
+    let mismatch = HandleValue::new(11, 4, "document").expect("valid");
+    assert_eq!(
+        ObjectHandle::<Other>::from_borrowed(&context, mismatch)
+            .expect_err("type mismatch")
+            .code(),
+        ErrorCode::TypeMismatch
+    );
+    assert_eq!(host.retains.load(Ordering::SeqCst), 2);
 
     host.retain_status
         .store(HmclStatus::HostError.into_raw(), Ordering::SeqCst);
@@ -300,6 +380,34 @@ fn host_outputs_are_copied_and_freed_once_even_when_decode_fails() {
             .expect_err("unknown status")
             .code(),
         ErrorCode::Internal
+    );
+    assert_eq!(host.buffer_frees.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn host_invoke_round_trips_bytes_and_ordered_maps_through_owned_buffers() {
+    let ordered = Value::Map(vec![
+        ("second".into(), Value::Integer(2)),
+        ("first".into(), Value::Bytes(vec![4, 5, 6])),
+    ]);
+    let host = FakeHost::new(ordered.to_wire().expect("ordered wire"));
+    let context = context(&host);
+    let bytes = Value::Bytes(vec![0, 1, 2, 255]);
+    assert_eq!(context.invoke("bytes", &bytes), Ok(ordered.clone()));
+    assert_eq!(
+        Value::from_wire(&host.last_input.lock().expect("last input")),
+        Ok(bytes)
+    );
+
+    *host.output.lock().expect("output") =
+        Value::Bytes(vec![9, 8, 7]).to_wire().expect("bytes wire");
+    assert_eq!(
+        context.invoke("map", &ordered),
+        Ok(Value::Bytes(vec![9, 8, 7]))
+    );
+    assert_eq!(
+        Value::from_wire(&host.last_input.lock().expect("last input")),
+        Ok(ordered)
     );
     assert_eq!(host.buffer_frees.load(Ordering::SeqCst), 2);
 }

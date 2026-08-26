@@ -1,7 +1,9 @@
+#[cfg(feature = "reference-query-export")]
+use hmcl_runtime_abi::hmcl_plugin_query_v1;
 use hmcl_runtime_abi::{
     HMCL_BRIDGE_ABI_V1, HMCL_HOST_API_V1_PREFIX_SIZE, HMCL_PLUGIN_API_V1_PREFIX_SIZE,
     HmclCallbackId, HmclCapabilityToken, HmclHandleId, HmclHostApiV1, HmclOwnedBuffer,
-    HmclPluginApiV1, HmclPluginId, HmclSlice, HmclStatus, hmcl_plugin_query_v1,
+    HmclPluginApiV1, HmclPluginId, HmclSlice, HmclStatus, negotiate_plugin_api_v1,
 };
 use std::ffi::c_void;
 use std::mem::{align_of, offset_of, size_of};
@@ -56,13 +58,22 @@ fn boundary_values_have_stable_c_layouts() {
 
     assert_eq!(size_of::<HmclPluginId>(), 8);
     assert_eq!(size_of::<HmclCapabilityToken>(), 8);
-    assert_eq!(size_of::<HmclHandleId>(), 8);
+    assert_eq!(size_of::<HmclHandleId>(), 16);
     assert_eq!(size_of::<HmclCallbackId>(), 8);
     assert_eq!(align_of::<HmclPluginId>(), 8);
     assert_eq!(align_of::<HmclCapabilityToken>(), 8);
     assert_eq!(align_of::<HmclHandleId>(), 8);
     assert_eq!(align_of::<HmclCallbackId>(), 8);
     assert_eq!(size_of::<Option<hmcl_runtime_abi::HmclAllocateFn>>(), 8);
+}
+
+#[test]
+fn handle_identity_preserves_id_and_generation_without_packing() {
+    let handle = HmclHandleId::from_raw(0x0123_4567_89ab_cdef, 0x7654_3210_fedc_ba98);
+    assert_eq!(
+        handle.into_parts(),
+        (0x0123_4567_89ab_cdef, 0x7654_3210_fedc_ba98)
+    );
 }
 
 #[test]
@@ -257,6 +268,7 @@ fn optional_callbacks_are_null_safe() {
     assert!(plugin.shutdown.is_none());
 }
 
+#[cfg(feature = "reference-query-export")]
 #[test]
 fn query_symbol_has_the_versioned_c_signature() {
     let query: unsafe extern "C" fn(*const HmclHostApiV1, *mut HmclPluginApiV1) -> HmclStatus =
@@ -395,7 +407,7 @@ mod dynamic_library {
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), feature = "reference-query-export"))]
 #[test]
 fn cdylib_exports_the_versioned_query_symbol() {
     let path = runtime_abi_cdylib();
@@ -409,6 +421,20 @@ fn cdylib_exports_the_versioned_query_symbol() {
     );
 }
 
+#[cfg(all(any(unix, windows), not(feature = "reference-query-export")))]
+#[test]
+fn cdylib_without_reference_feature_does_not_export_query_symbol() {
+    let path = runtime_abi_cdylib();
+    let library = dynamic_library::DynamicLibrary::open(&path)
+        .unwrap_or_else(|error| panic!("failed to load {}: {error}", path.display()));
+
+    assert!(
+        !library.exports(c"hmcl_plugin_query_v1"),
+        "{} unexpectedly exports hmcl_plugin_query_v1",
+        path.display()
+    );
+}
+
 #[test]
 fn query_rejects_null_and_short_tables() {
     let host = HmclHostApiV1::EMPTY;
@@ -416,12 +442,12 @@ fn query_rejects_null_and_short_tables() {
 
     // SAFETY: Null pointers are intentionally supplied to exercise query validation.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(std::ptr::null(), &mut plugin) },
+        unsafe { negotiate_plugin_api_v1(std::ptr::null(), &mut plugin) },
         HmclStatus::InvalidArgument
     );
     // SAFETY: Null pointers are intentionally supplied to exercise query validation.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(&host, std::ptr::null_mut()) },
+        unsafe { negotiate_plugin_api_v1(&host, std::ptr::null_mut()) },
         HmclStatus::InvalidArgument
     );
 
@@ -431,7 +457,7 @@ fn query_rejects_null_and_short_tables() {
     };
     // SAFETY: Both pointers refer to live, correctly aligned table values.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(&short_host, &mut plugin) },
+        unsafe { negotiate_plugin_api_v1(&short_host, &mut plugin) },
         HmclStatus::BufferTooSmall
     );
 
@@ -442,7 +468,7 @@ fn query_rejects_null_and_short_tables() {
     };
     // SAFETY: Both pointers refer to live, correctly aligned table values.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(&host, &mut short_plugin) },
+        unsafe { negotiate_plugin_api_v1(&host, &mut short_plugin) },
         HmclStatus::BufferTooSmall
     );
 }
@@ -503,7 +529,7 @@ fn query_rejects_genuinely_four_byte_table_allocations_without_writing_output() 
     // SAFETY: `short_host` is aligned for the host table and contains its advertised four-byte
     // prefix. The implementation must reject that size before reading the absent version field.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(short_host.as_host(), &mut plugin) },
+        unsafe { negotiate_plugin_api_v1(short_host.as_host(), &mut plugin) },
         HmclStatus::BufferTooSmall
     );
     assert_eq!(plugin.context, sentinel_context);
@@ -515,7 +541,7 @@ fn query_rejects_genuinely_four_byte_table_allocations_without_writing_output() 
     // SAFETY: `short_plugin` is aligned for the plugin table and contains its advertised four-byte
     // prefix. The implementation must reject that size before reading or writing any other field.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(&host, short_plugin.as_plugin()) },
+        unsafe { negotiate_plugin_api_v1(&host, short_plugin.as_plugin()) },
         HmclStatus::BufferTooSmall
     );
     assert_eq!(short_plugin.struct_size(), size_of::<u32>() as u32);
@@ -530,7 +556,7 @@ fn query_rejects_unknown_versions() {
     let mut plugin = HmclPluginApiV1::with_required_prefix();
     // SAFETY: Both pointers refer to live, correctly aligned table values.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(&host, &mut plugin) },
+        unsafe { negotiate_plugin_api_v1(&host, &mut plugin) },
         HmclStatus::UnsupportedAbi
     );
 
@@ -538,7 +564,7 @@ fn query_rejects_unknown_versions() {
     plugin.abi_version = HMCL_BRIDGE_ABI_V1 + 1;
     // SAFETY: Both pointers refer to live, correctly aligned table values.
     assert_eq!(
-        unsafe { hmcl_plugin_query_v1(&host, &mut plugin) },
+        unsafe { negotiate_plugin_api_v1(&host, &mut plugin) },
         HmclStatus::UnsupportedAbi
     );
     assert_eq!(plugin.abi_version, HMCL_BRIDGE_ABI_V1 + 1);
@@ -574,7 +600,7 @@ fn query_accepts_larger_tables_without_touching_trailing_fields() {
     };
 
     // SAFETY: `prefix` begins at offset zero and advertises the complete allocation size.
-    let status = unsafe { hmcl_plugin_query_v1(&host.prefix, &mut plugin.prefix) };
+    let status = unsafe { negotiate_plugin_api_v1(&host.prefix, &mut plugin.prefix) };
     assert_eq!(status, HmclStatus::Ok);
     assert_eq!(plugin.prefix.struct_size, HMCL_PLUGIN_API_V1_PREFIX_SIZE);
     assert_eq!(plugin.prefix.abi_version, HMCL_BRIDGE_ABI_V1);

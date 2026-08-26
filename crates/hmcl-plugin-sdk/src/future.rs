@@ -10,6 +10,7 @@ pub(crate) struct CallbackRegistry {
 }
 
 struct RegistryState {
+    closed: bool,
     next_id: u64,
     entries: HashMap<u64, Arc<Entry>>,
 }
@@ -30,6 +31,7 @@ impl CallbackRegistry {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(RegistryState {
+                closed: false,
                 next_id: 1,
                 entries: HashMap::new(),
             }),
@@ -38,7 +40,7 @@ impl CallbackRegistry {
 
     pub(crate) fn pair(self: &Arc<Self>) -> Result<(Callback, PluginFuture), Error> {
         let mut registry = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if registry.entries.len() >= MAX_PENDING_CALLBACKS {
+        if registry.closed || registry.entries.len() >= MAX_PENDING_CALLBACKS {
             return Err(Error::new(ErrorCode::Unavailable));
         }
         let id = registry.next_id;
@@ -68,6 +70,28 @@ impl CallbackRegistry {
             .unwrap_or_else(|error| error.into_inner())
             .entries
             .len()
+    }
+
+    pub(crate) fn close(&self) {
+        let entries = {
+            let mut registry = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            registry.closed = true;
+            registry
+                .entries
+                .drain()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+        };
+        for entry in entries {
+            let mut state = entry
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if matches!(*state, EntryState::Pending) {
+                *state = EntryState::Cancelled;
+                entry.changed.notify_all();
+            }
+        }
     }
 
     fn remove(&self, id: u64, entry: &Arc<Entry>) {
@@ -108,10 +132,25 @@ impl Callback {
                     self.entry.changed.notify_all();
                     return Err(Error::new(ErrorCode::Cancelled));
                 };
+                let mut registry_state = registry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if registry_state.closed
+                    || !registry_state
+                        .entries
+                        .get(&self.id)
+                        .is_some_and(|registered| Arc::ptr_eq(registered, &self.entry))
+                {
+                    *state = EntryState::Cancelled;
+                    self.entry.changed.notify_all();
+                    return Err(Error::new(ErrorCode::Cancelled));
+                }
                 *state = EntryState::Complete(result);
+                registry_state.entries.remove(&self.id);
                 self.entry.changed.notify_all();
+                drop(registry_state);
                 drop(state);
-                registry.remove(self.id, &self.entry);
                 Ok(())
             }
             EntryState::Complete(_) => Err(Error::new(ErrorCode::CallbackFailed)),
