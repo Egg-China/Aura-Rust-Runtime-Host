@@ -10,6 +10,8 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 
+const TABLE_HEADER_SIZE: usize = 2 * size_of::<u32>();
+
 /// Version number implemented by the v1 host and plugin tables.
 pub const HMCL_BRIDGE_ABI_V1: u32 = 1;
 
@@ -296,6 +298,53 @@ impl HmclPluginApiV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TableHeader {
+    struct_size: u32,
+    abi_version: u32,
+}
+
+fn decode_struct_size(prefix: &[u8]) -> Result<u32, HmclStatus> {
+    let encoded = prefix
+        .get(..size_of::<u32>())
+        .ok_or(HmclStatus::BufferTooSmall)?;
+    let encoded =
+        <[u8; size_of::<u32>()]>::try_from(encoded).map_err(|_| HmclStatus::BufferTooSmall)?;
+    Ok(u32::from_ne_bytes(encoded))
+}
+
+fn decode_table_header(prefix: &[u8]) -> Result<TableHeader, HmclStatus> {
+    let struct_size = decode_struct_size(prefix)?;
+    if struct_size < TABLE_HEADER_SIZE as u32 {
+        return Err(HmclStatus::BufferTooSmall);
+    }
+
+    let encoded_version = prefix
+        .get(size_of::<u32>()..TABLE_HEADER_SIZE)
+        .ok_or(HmclStatus::BufferTooSmall)?;
+    let encoded_version = <[u8; size_of::<u32>()]>::try_from(encoded_version)
+        .map_err(|_| HmclStatus::BufferTooSmall)?;
+    Ok(TableHeader {
+        struct_size,
+        abi_version: u32::from_ne_bytes(encoded_version),
+    })
+}
+
+// SAFETY: `table` must be aligned and readable for its first `u32`. When that value advertises a
+// prefix of at least eight bytes, `table` must be readable for those eight bytes.
+unsafe fn read_table_header(table: *const u8) -> Result<TableHeader, HmclStatus> {
+    // SAFETY: The caller guarantees that the first fixed-width field is readable.
+    let size_prefix = unsafe { std::slice::from_raw_parts(table, size_of::<u32>()) };
+    let struct_size = decode_struct_size(size_prefix)?;
+    if struct_size < TABLE_HEADER_SIZE as u32 {
+        return Err(HmclStatus::BufferTooSmall);
+    }
+
+    // SAFETY: A size of at least `TABLE_HEADER_SIZE` advertises a readable complete table header.
+    let header_prefix = unsafe { std::slice::from_raw_parts(table, TABLE_HEADER_SIZE) };
+    decode_table_header(header_prefix)
+}
+
 /// Negotiates the version-one host and plugin function-table prefixes.
 ///
 /// The host initializes `out_plugin.struct_size` to its writable capacity and
@@ -305,36 +354,39 @@ impl HmclPluginApiV1 {
 ///
 /// # Safety
 ///
-/// `host` must be non-null, aligned, and readable for the complete prefix advertised by its
-/// `struct_size`. `out_plugin` must be non-null, aligned, and writable for the complete prefix
-/// advertised by its initial `struct_size`. The two allocations must not overlap. Both pointers
-/// must remain valid for the duration of this call.
+/// `host` must be non-null, aligned, and readable for its first `u32` and for the complete prefix
+/// advertised by that `struct_size`. `out_plugin` must be non-null, aligned, and readable and
+/// writable under the same staged rule. The two allocations must not overlap. Both pointers must
+/// remain valid for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hmcl_plugin_query_v1(
     host: *const HmclHostApiV1,
     out_plugin: *mut HmclPluginApiV1,
 ) -> HmclStatus {
-    if host.is_null() || out_plugin.is_null() {
+    if host.is_null() || out_plugin.is_null() || !host.is_aligned() || !out_plugin.is_aligned() {
         return HmclStatus::InvalidArgument;
     }
 
-    // SAFETY: The function contract requires both table headers to be readable. Values are copied
-    // before any output write so version and capacity validation cannot observe modified fields.
-    let (host_size, host_version, output_size, output_version) = unsafe {
-        (
-            (*host).struct_size,
-            (*host).abi_version,
-            (*out_plugin).struct_size,
-            (*out_plugin).abi_version,
-        )
+    // SAFETY: Null and alignment checks are complete. The function contract guarantees each first
+    // field and any subsequently advertised header bytes are readable.
+    let host_header = match unsafe { read_table_header(host.cast()) } {
+        Ok(header) => header,
+        Err(status) => return status,
+    };
+    // SAFETY: The same staged-read guarantees apply independently to the output table.
+    let output_header = match unsafe { read_table_header(out_plugin.cast()) } {
+        Ok(header) => header,
+        Err(status) => return status,
     };
 
-    if host_size < size_of::<HmclHostApiV1>() as u32
-        || output_size < size_of::<HmclPluginApiV1>() as u32
+    if host_header.struct_size < size_of::<HmclHostApiV1>() as u32
+        || output_header.struct_size < size_of::<HmclPluginApiV1>() as u32
     {
         return HmclStatus::BufferTooSmall;
     }
-    if host_version != HMCL_BRIDGE_ABI_V1 || output_version != HMCL_BRIDGE_ABI_V1 {
+    if host_header.abi_version != HMCL_BRIDGE_ABI_V1
+        || output_header.abi_version != HMCL_BRIDGE_ABI_V1
+    {
         return HmclStatus::UnsupportedAbi;
     }
 
@@ -342,4 +394,19 @@ pub unsafe extern "C" fn hmcl_plugin_query_v1(
     // entire v1 prefix. Writing one prefix deliberately leaves unknown trailing fields untouched.
     unsafe { out_plugin.write(HmclPluginApiV1::with_required_prefix()) };
     HmclStatus::Ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HmclStatus;
+
+    #[test]
+    fn header_decoder_rejects_an_exact_four_byte_prefix() {
+        let prefix = 4_u32.to_ne_bytes();
+
+        assert!(matches!(
+            super::decode_table_header(&prefix),
+            Err(HmclStatus::BufferTooSmall)
+        ));
+    }
 }

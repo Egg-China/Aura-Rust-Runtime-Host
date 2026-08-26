@@ -4,6 +4,7 @@ use hmcl_runtime_abi::{
 };
 use std::ffi::c_void;
 use std::mem::{align_of, offset_of, size_of};
+use std::ptr::NonNull;
 
 #[test]
 fn host_api_v1_has_stable_prefix() {
@@ -98,6 +99,151 @@ fn query_symbol_has_the_versioned_c_signature() {
     let _ = query;
 }
 
+#[cfg(any(unix, windows))]
+fn runtime_abi_cdylib() -> std::path::PathBuf {
+    let test_executable = std::env::current_exe().expect("the test executable path is available");
+    let deps_directory = test_executable
+        .parent()
+        .expect("the test executable has a parent directory");
+    let library_name = format!(
+        "{}hmcl_runtime_abi{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    let candidates = std::fs::read_dir(deps_directory)
+        .expect("the Cargo dependency directory is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(&library_name))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "expected exactly one {library_name} beside the test executable"
+    );
+    candidates.into_iter().next().expect("one candidate exists")
+}
+
+#[cfg(windows)]
+mod dynamic_library {
+    use std::ffi::{CStr, c_char, c_void};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::NonNull;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(file_name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, procedure_name: *const c_char) -> *mut c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+    }
+
+    pub(super) struct DynamicLibrary(*mut c_void);
+
+    impl DynamicLibrary {
+        pub(super) fn open(path: &Path) -> Result<Self, std::io::Error> {
+            let path = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            // SAFETY: `path` is terminated and remains live for the duration of the call.
+            let module = unsafe { LoadLibraryW(path.as_ptr()) };
+            NonNull::new(module)
+                .map(|module| Self(module.as_ptr()))
+                .ok_or_else(std::io::Error::last_os_error)
+        }
+
+        pub(super) fn exports(&self, symbol: &CStr) -> bool {
+            // SAFETY: `self.0` is a live module and `symbol` is null-terminated.
+            !unsafe { GetProcAddress(self.0, symbol.as_ptr()) }.is_null()
+        }
+    }
+
+    impl Drop for DynamicLibrary {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a module returned by `LoadLibraryW` and is released once here.
+            let _ = unsafe { FreeLibrary(self.0) };
+        }
+    }
+}
+
+#[cfg(unix)]
+mod dynamic_library {
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::NonNull;
+
+    const RTLD_NOW: c_int = 2;
+
+    #[cfg_attr(not(target_vendor = "apple"), link(name = "dl"))]
+    unsafe extern "C" {
+        fn dlopen(file_name: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+        fn dlerror() -> *const c_char;
+    }
+
+    pub(super) struct DynamicLibrary(*mut c_void);
+
+    impl DynamicLibrary {
+        pub(super) fn open(path: &Path) -> Result<Self, String> {
+            let path = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| "the dynamic library path contains a null byte".to_owned())?;
+            // SAFETY: `path` is null-terminated and `RTLD_NOW` is a valid loader flag.
+            let module = unsafe { dlopen(path.as_ptr(), RTLD_NOW) };
+            NonNull::new(module)
+                .map(|module| Self(module.as_ptr()))
+                .ok_or_else(last_error)
+        }
+
+        pub(super) fn exports(&self, symbol: &CStr) -> bool {
+            // SAFETY: `self.0` is a live module and `symbol` is null-terminated.
+            !unsafe { dlsym(self.0, symbol.as_ptr()) }.is_null()
+        }
+    }
+
+    impl Drop for DynamicLibrary {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a module returned by `dlopen` and is closed once here.
+            let _ = unsafe { dlclose(self.0) };
+        }
+    }
+
+    fn last_error() -> String {
+        // SAFETY: `dlerror` returns either null or a null-terminated loader-owned string.
+        let error = unsafe { dlerror() };
+        if error.is_null() {
+            "dynamic loader did not provide an error".to_owned()
+        } else {
+            // SAFETY: The non-null result is a null-terminated string valid until the next loader
+            // operation on this thread; it is copied before returning.
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn cdylib_exports_the_versioned_query_symbol() {
+    let path = runtime_abi_cdylib();
+    let library = dynamic_library::DynamicLibrary::open(&path)
+        .unwrap_or_else(|error| panic!("failed to load {}: {error}", path.display()));
+
+    assert!(
+        library.exports(c"hmcl_plugin_query_v1"),
+        "{} does not export hmcl_plugin_query_v1",
+        path.display()
+    );
+}
+
 #[test]
 fn query_rejects_null_and_short_tables() {
     let host = HmclHostApiV1::EMPTY;
@@ -134,6 +280,80 @@ fn query_rejects_null_and_short_tables() {
         unsafe { hmcl_plugin_query_v1(&host, &mut short_plugin) },
         HmclStatus::BufferTooSmall
     );
+}
+
+struct SizeOnlyPrefix {
+    allocation: NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl SizeOnlyPrefix {
+    fn new() -> Self {
+        let table_alignment = align_of::<HmclHostApiV1>().max(align_of::<HmclPluginApiV1>());
+        let layout = std::alloc::Layout::from_size_align(size_of::<u32>(), table_alignment)
+            .expect("the ABI prefix layout is valid");
+        // SAFETY: `layout` has non-zero size and valid power-of-two alignment.
+        let allocation = NonNull::new(unsafe { std::alloc::alloc(layout) })
+            .expect("the test prefix allocation succeeds");
+        // SAFETY: The allocation is aligned for and contains exactly one `u32`.
+        unsafe {
+            allocation
+                .cast::<u32>()
+                .as_ptr()
+                .write(size_of::<u32>() as u32)
+        };
+        Self { allocation, layout }
+    }
+
+    fn as_host(&self) -> *const HmclHostApiV1 {
+        self.allocation.as_ptr().cast()
+    }
+
+    fn as_plugin(&mut self) -> *mut HmclPluginApiV1 {
+        self.allocation.as_ptr().cast()
+    }
+
+    fn struct_size(&self) -> u32 {
+        // SAFETY: The allocation contains one initialized `u32` for its entire lifetime.
+        unsafe { self.allocation.cast::<u32>().as_ptr().read() }
+    }
+}
+
+impl Drop for SizeOnlyPrefix {
+    fn drop(&mut self) {
+        // SAFETY: `allocation` was returned by `alloc` for this exact layout and is still live.
+        unsafe { std::alloc::dealloc(self.allocation.as_ptr(), self.layout) };
+    }
+}
+
+#[test]
+fn query_rejects_genuinely_four_byte_table_allocations_without_writing_output() {
+    let short_host = SizeOnlyPrefix::new();
+    let sentinel_context = NonNull::<u8>::dangling().as_ptr().cast::<c_void>();
+    let mut plugin = HmclPluginApiV1 {
+        context: sentinel_context,
+        ..HmclPluginApiV1::with_required_prefix()
+    };
+
+    // SAFETY: `short_host` is aligned for the host table and contains its advertised four-byte
+    // prefix. The implementation must reject that size before reading the absent version field.
+    assert_eq!(
+        unsafe { hmcl_plugin_query_v1(short_host.as_host(), &mut plugin) },
+        HmclStatus::BufferTooSmall
+    );
+    assert_eq!(plugin.context, sentinel_context);
+    assert_eq!(plugin.struct_size, size_of::<HmclPluginApiV1>() as u32);
+    assert_eq!(plugin.abi_version, HMCL_BRIDGE_ABI_V1);
+
+    let host = HmclHostApiV1::with_required_prefix();
+    let mut short_plugin = SizeOnlyPrefix::new();
+    // SAFETY: `short_plugin` is aligned for the plugin table and contains its advertised four-byte
+    // prefix. The implementation must reject that size before reading or writing any other field.
+    assert_eq!(
+        unsafe { hmcl_plugin_query_v1(&host, short_plugin.as_plugin()) },
+        HmclStatus::BufferTooSmall
+    );
+    assert_eq!(short_plugin.struct_size(), size_of::<u32>() as u32);
 }
 
 #[test]
