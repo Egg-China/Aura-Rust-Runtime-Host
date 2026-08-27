@@ -1,12 +1,23 @@
 package dev.hmclce.runtime.rust;
 
-import org.jackhuang.hmcl.plugin.PluginManifest;
 import org.jackhuang.hmcl.plugin.PluginArtifactIdentity;
+import org.jackhuang.hmcl.plugin.PluginDataObject;
+import org.jackhuang.hmcl.plugin.PluginDataValue;
+import org.jackhuang.hmcl.plugin.PluginHookEvent;
+import org.jackhuang.hmcl.plugin.PluginHookPoint;
+import org.jackhuang.hmcl.plugin.PluginHookResult;
+import org.jackhuang.hmcl.plugin.PluginManifest;
+import org.jackhuang.hmcl.plugin.PluginSecretAccess;
+import org.jackhuang.hmcl.plugin.bridge.BridgeValue;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
+import org.jackhuang.hmcl.plugin.bridge.PluginPermissionAuthority;
+import org.jackhuang.hmcl.plugin.bridge.RuntimeBridgeWireCodec;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeBridgeTransport;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadContext;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadHandle;
 import org.jetbrains.annotations.Nullable;
@@ -15,13 +26,19 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.Reader;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
@@ -29,6 +46,8 @@ import java.util.jar.JarFile;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -55,6 +74,7 @@ final class RustRuntimeHostPluginTest {
         assertTrue(descriptor.installed());
         assertTrue(descriptor.enabled());
         assertFalse(descriptor.reserved());
+        assertTrue(manifest.getProvidesRuntimes().get(0).getFeatures().contains(RuntimeFeature.HOOKS));
     }
 
     /// Every supported build target must select one stable package-relative native engine path.
@@ -231,6 +251,117 @@ final class RustRuntimeHostPluginTest {
         assertEquals("native-41", handle.payloadId());
         assertEquals(List.of("enable:native-41", "disable:native-41", "unload:native-41"),
                 engine.payloadEvents);
+    }
+
+    /// Hook dispatch must cross the native boundary as one exact language-neutral envelope.
+    @Test
+    void dispatchesHookThroughCanonicalNativeOperation() throws Exception {
+        PluginManifest manifest = readManifest();
+        FakeEngine engine = new FakeEngine();
+        engine.invocationResult = hookWire(mapOf(
+                "contractVersion", BridgeValue.integer(1L),
+                "action", BridgeValue.string("unchanged")
+        ));
+        RuntimeProvider provider = new RustRuntimeProvider(
+                manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
+        RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
+        RuntimePayloadHandle handle = new RuntimePayloadHandle(
+                "dev.hmclce.test.rust-payload", manifest.getId(), "native-41");
+        PluginCapabilityToken token = hookToken();
+        PluginHookEvent event = hookEvent();
+
+        PluginHookResult result = invoker.invokeHook(handle, token, event, Duration.ofMillis(275));
+
+        Map<String, BridgeValue> expectedData = new LinkedHashMap<>();
+        expectedData.put("enabled", BridgeValue.bool(true));
+        expectedData.put("attempts", BridgeValue.integer(3L));
+        Map<String, BridgeValue> expectedEvent = new LinkedHashMap<>();
+        expectedEvent.put("contractVersion", BridgeValue.integer(1L));
+        expectedEvent.put("dispatchId", BridgeValue.string("dispatch-rust-42"));
+        expectedEvent.put("point", BridgeValue.string("before-game-launch"));
+        expectedEvent.put("occurredAt", BridgeValue.string("2026-08-27T12:34:56Z"));
+        expectedEvent.put("data", BridgeValue.map(expectedData));
+        assertEquals(PluginHookResult.Action.UNCHANGED, result.action());
+        assertEquals("native-41", engine.invokedPayloadId);
+        assertEquals("hook.before-game-launch", engine.invokedOperation);
+        assertEquals(0L, engine.invokedCallbackId);
+        assertEquals(BridgeValue.map(expectedEvent), RuntimeBridgeWireCodec.decode(engine.invokedInput));
+    }
+
+    /// Hook dispatch must decode every valid action and classify malformed native output as absent.
+    @Test
+    void decodesNativeHookResultsWithoutAcceptingMalformedOutput() throws Exception {
+        PluginManifest manifest = readManifest();
+        FakeEngine engine = new FakeEngine();
+        RuntimeProvider provider = new RustRuntimeProvider(
+                manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
+        RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
+        RuntimePayloadHandle handle = new RuntimePayloadHandle(
+                "dev.hmclce.test.rust-payload", manifest.getId(), "native-41");
+        PluginCapabilityToken token = hookToken();
+        PluginHookEvent event = hookEvent();
+
+        engine.invocationResult = hookWire(mapOf(
+                "contractVersion", BridgeValue.integer(1L),
+                "action", BridgeValue.string("unchanged")
+        ));
+        assertEquals(PluginHookResult.Action.UNCHANGED,
+                invoker.invokeHook(handle, token, event, Duration.ofSeconds(1)).action());
+
+        engine.invocationResult = hookWire(mapOf(
+                "contractVersion", BridgeValue.integer(1L),
+                "action", BridgeValue.string("replace"),
+                "data", BridgeValue.map(mapOf("attempts", BridgeValue.integer(7L))),
+                "protectedSecrets", BridgeValue.map(mapOf(
+                        "access-token", BridgeValue.string("replacement")))
+        ));
+        PluginHookResult replacement = invoker.invokeHook(handle, token, event, Duration.ofSeconds(1));
+        assertEquals(PluginHookResult.Action.REPLACE, replacement.action());
+        assertEquals(new BigDecimal("7"), replacement.data().requireNumber("attempts"));
+        assertEquals(Map.of("access-token", "replacement"), replacement.protectedSecrets());
+
+        engine.invocationResult = hookWire(mapOf(
+                "contractVersion", BridgeValue.integer(1L),
+                "action", BridgeValue.string("cancel"),
+                "reasonCode", BridgeValue.string("runtime-policy"),
+                "message", BridgeValue.string("Blocked by Rust plugin")
+        ));
+        PluginHookResult cancellation = invoker.invokeHook(handle, token, event, Duration.ofSeconds(1));
+        assertEquals(PluginHookResult.Action.CANCEL, cancellation.action());
+        assertEquals("runtime-policy", cancellation.reasonCode());
+        assertEquals("Blocked by Rust plugin", cancellation.message());
+
+        engine.invocationResult = new byte[]{0x01, 0x02};
+        assertNull(invoker.invokeHook(handle, token, event, Duration.ofSeconds(1)));
+    }
+
+    /// Hook dispatch must reject invalid Java authority, deadlines, and Provider ownership before native invocation.
+    @Test
+    void rejectsInvalidHookInvocationBoundary() throws Exception {
+        PluginManifest manifest = readManifest();
+        FakeEngine engine = new FakeEngine();
+        engine.invocationResult = hookWire(mapOf(
+                "contractVersion", BridgeValue.integer(1L),
+                "action", BridgeValue.string("unchanged")
+        ));
+        RuntimeProvider provider = new RustRuntimeProvider(
+                manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
+        RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
+        RuntimePayloadHandle handle = new RuntimePayloadHandle(
+                "dev.hmclce.test.rust-payload", manifest.getId(), "native-41");
+        PluginHookEvent event = hookEvent();
+
+        assertThrows(NullPointerException.class,
+                () -> invoker.invokeHook(handle, null, event, Duration.ofSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> invoker.invokeHook(handle, hookToken(), event, Duration.ZERO));
+        assertThrows(IllegalArgumentException.class,
+                () -> invoker.invokeHook(handle, hookToken(), event, Duration.ofMillis(-1)));
+        RuntimePayloadHandle foreign = new RuntimePayloadHandle(
+                "dev.hmclce.test.rust-payload", "dev.hmclce.runtime.foreign", "native-41");
+        assertThrows(IOException.class,
+                () -> invoker.invokeHook(foreign, hookToken(), event, Duration.ofSeconds(1)));
+        assertNull(engine.invokedOperation);
     }
 
     /// JNI Bridge callbacks must resolve only the Java context mapped to their opaque Host session.
@@ -444,6 +575,57 @@ final class RustRuntimeHostPluginTest {
         }
     }
 
+    /// Creates one live opaque token whose Java identity must stop at the Provider boundary.
+    ///
+    /// @return live test capability token
+    private static PluginCapabilityToken hookToken() {
+        return new PluginPermissionAuthority().issue(
+                new PluginArtifactIdentity("dev.hmclce.test.rust-payload", "1.0.0", "e".repeat(64)),
+                PluginExecutionMode.EMBEDDED,
+                Set.of(),
+                "runtime.payload",
+                Duration.ofMinutes(1)
+        );
+    }
+
+    /// Creates one deterministic Hook event with ordinary data and a denied Java secret accessor.
+    ///
+    /// @return deterministic Hook event
+    private static PluginHookEvent hookEvent() {
+        Map<String, PluginDataValue> data = new LinkedHashMap<>();
+        data.put("enabled", PluginDataValue.bool(true));
+        data.put("attempts", PluginDataValue.number(new BigDecimal("3")));
+        return new PluginHookEvent(
+                1,
+                "dispatch-rust-42",
+                PluginHookPoint.BEFORE_GAME_LAUNCH,
+                Instant.parse("2026-08-27T12:34:56Z"),
+                PluginDataObject.of(data),
+                PluginSecretAccess.denied("dev.hmclce.test.rust-payload")
+        );
+    }
+
+    /// Creates one insertion-ordered Bridge map from alternating string keys and values.
+    ///
+    /// @param entries alternating string keys and Bridge values
+    /// @return insertion-ordered Bridge map
+    private static Map<String, BridgeValue> mapOf(Object... entries) {
+        Map<String, BridgeValue> values = new LinkedHashMap<>();
+        for (int index = 0; index < entries.length; index += 2) {
+            values.put((String) entries[index], (BridgeValue) entries[index + 1]);
+        }
+        return values;
+    }
+
+    /// Encodes one manually constructed external Hook result.
+    ///
+    /// @param values exact result fields
+    /// @return canonical Bridge Value v1 wire bytes
+    /// @throws IOException if the test fixture cannot be encoded
+    private static byte[] hookWire(Map<String, BridgeValue> values) throws IOException {
+        return RuntimeBridgeWireCodec.encode(BridgeValue.map(values));
+    }
+
     /// Creates one native library fixture at the exact packaged target path.
     private static Path createNativeLibrary(Path root, String platform, String filename) throws IOException {
         Path library = root.resolve("native").resolve(platform).resolve(filename);
@@ -486,6 +668,21 @@ final class RustRuntimeHostPluginTest {
         /// Payload lifecycle events after loading.
         private final List<String> payloadEvents = new ArrayList<>();
 
+        /// Native payload identifier from the latest generic invocation.
+        private @Nullable String invokedPayloadId;
+
+        /// Native operation from the latest generic invocation.
+        private @Nullable String invokedOperation;
+
+        /// Wire input from the latest generic invocation.
+        private byte @Nullable [] invokedInput;
+
+        /// Callback identifier from the latest generic invocation.
+        private long invokedCallbackId = Long.MIN_VALUE;
+
+        /// Optional scripted result returned by the next and subsequent generic invocations.
+        private byte @Nullable [] invocationResult;
+
         /// Records engine initialization.
         @Override
         public void initialize() {
@@ -518,11 +715,15 @@ final class RustRuntimeHostPluginTest {
             payloadEvents.add("disable:" + payloadId);
         }
 
-        /// Echoes raw-byte payload invocations.
+        /// Records raw-byte payload invocations and returns the configured result or an input echo.
         @Override
         public byte[] invokePayload(String payloadId, String operation, byte[] input, long callbackId) {
             payloadEvents.add("invoke:" + payloadId + ":" + operation + ":" + callbackId);
-            return input.clone();
+            invokedPayloadId = payloadId;
+            invokedOperation = operation;
+            invokedInput = input.clone();
+            invokedCallbackId = callbackId;
+            return invocationResult == null ? input.clone() : invocationResult.clone();
         }
 
         /// Records payload unload.

@@ -1,19 +1,26 @@
 package dev.hmclce.runtime.rust;
 
+import org.jackhuang.hmcl.plugin.PluginHookEvent;
+import org.jackhuang.hmcl.plugin.PluginHookResult;
+import org.jackhuang.hmcl.plugin.bridge.PluginCapabilityToken;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProvider;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDeclaration;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeProviderDescriptor;
+import org.jackhuang.hmcl.plugin.runtime.RuntimeHookWireCodec;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadContext;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadHandle;
 import org.jetbrains.annotations.NotNullByDefault;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /// Publishes the Rust runtime declaration and delegates native lifecycle negotiation to its engine.
 @NotNullByDefault
-public final class RustRuntimeProvider implements RuntimeProvider {
+public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvider.HookInvoker {
     /// Native engine owned by this Provider registration.
     private final Engine engine;
 
@@ -118,6 +125,37 @@ public final class RustRuntimeProvider implements RuntimeProvider {
             long callbackId
     ) throws IOException {
         return engine.invokePayload(requireOwnedHandle(handle), operation, input, callbackId);
+    }
+
+    /// Invokes one Hook through the canonical language-neutral wire contract.
+    ///
+    /// The Java capability token is validated for presence but never inspected or serialized. Timeout enforcement
+    /// remains owned by the launcher dispatcher; the Provider rejects invalid deadlines before entering native code.
+    ///
+    /// @param handle Provider-owned payload handle
+    /// @param token opaque short-lived launcher capability token
+    /// @param event immutable Hook event
+    /// @param timeout positive dispatcher callback deadline
+    /// @return decoded Hook result, or `null` for malformed native output
+    /// @throws IOException if ownership validation, event encoding, or native invocation fails
+    @Override
+    public @Nullable PluginHookResult invokeHook(
+            RuntimePayloadHandle handle,
+            PluginCapabilityToken token,
+            PluginHookEvent event,
+            Duration timeout
+    ) throws IOException {
+        Objects.requireNonNull(token, "token");
+        Duration deadline = Objects.requireNonNull(timeout, "timeout");
+        if (deadline.isZero() || deadline.isNegative()) {
+            throw new IllegalArgumentException("Rust Runtime Hook timeout must be positive");
+        }
+        return RuntimeHookWireCodec.decodeResult(engine.invokePayload(
+                requireOwnedHandle(handle),
+                RuntimeHookWireCodec.operation(event.point()),
+                RuntimeHookWireCodec.encodeEvent(event),
+                0L
+        ));
     }
 
     /// Shuts down and unloads one disabled native payload.
