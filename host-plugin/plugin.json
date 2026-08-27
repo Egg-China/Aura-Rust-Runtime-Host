@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 5,
+  "id": "dev.hmclce.runtime.rust-host",
+  "name": "HMCL CE Rust Runtime Host",
+  "version": "0.1.0",
+  "description": "Optional embedded Rust runtime provider for schema-v5 plugins.",
+  "author": "HMCL CE Community",
+  "type": "java",
+  "runtime": "java",
+  "abi": 2,
+  "entrypoint": "dev.hmclce.runtime.rust.RustRuntimeHostPlugin",
+  "pluginKind": "runtime-provider",
+  "executionMode": "embedded",
+  "platforms": [
+    "windows-x64",
+    "windows-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "macos-x64",
+    "macos-arm64"
+  ],
+  "dependencies": [],
+  "permissions": [
+    "native-code"
+  ],
+  "requiredPermissions": [
+    "native-code"
+  ],
+  "hooks": [],
+  "patches": [],
+  "launcherVersion": ">=26.8",
+  "providesRuntimes": [
+    {
+      "runtime": "rust",
+      "abis": [1],
+      "bridgeAbi": 1,
+      "executionModes": [
+        "embedded"
+      ],
+      "features": [
+        "bridge",
+        "native"
+      ]
+    }
+  ]
+}
