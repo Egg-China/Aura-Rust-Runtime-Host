@@ -3,6 +3,7 @@ members = [
     "crates/hmcl-runtime-abi",
     "crates/hmcl-runtime-protocol",
     "crates/hmcl-plugin-sdk",
+    "crates/hmcl-rust-host-process",
     "crates/hmcl-rust-host-native",
 ]
 exclude = ["crates/hmcl-rust-host-native/tests/fixtures"]

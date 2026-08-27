@@ -61,6 +61,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hmcl-rust-host-process"
+version = "0.1.0"
+dependencies = [
+ "hmcl-plugin-sdk",
+ "hmcl-runtime-protocol",
+ "hmcl-rust-host-native",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
