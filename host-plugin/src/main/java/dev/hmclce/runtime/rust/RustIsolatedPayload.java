@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /// Supervises one process-isolated Rust payload and services its synchronous Bridge callbacks.
 @NotNullByDefault
-public final class RustIsolatedPayload implements AutoCloseable {
+public final class RustIsolatedPayload implements RustRuntimeEngine.IsolatedPayload {
     /// Deadline for protocol negotiation and payload loading.
     private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5L);
 

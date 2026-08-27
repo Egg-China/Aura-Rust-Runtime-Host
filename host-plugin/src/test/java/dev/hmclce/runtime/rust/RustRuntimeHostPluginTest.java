@@ -20,6 +20,7 @@ import org.jackhuang.hmcl.plugin.runtime.RuntimeBridgeTransport;
 import org.jackhuang.hmcl.plugin.runtime.RuntimeFeature;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadContext;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadHandle;
+import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -40,6 +41,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
 
@@ -253,6 +256,69 @@ final class RustRuntimeHostPluginTest {
                 engine.payloadEvents);
     }
 
+    /// Hybrid routing must isolate backend identifiers, deadlines, ownership, and close order.
+    @Test
+    void routesEmbeddedAndIsolatedPayloadsThroughDistinctOpaqueHandles() throws IOException {
+        List<String> events = new ArrayList<>();
+        FakeEngine embedded = new FakeEngine();
+        embedded.closeEvent = () -> events.add("embedded:close");
+        FakeIsolatedPayload isolated = new FakeIsolatedPayload(events);
+        AtomicInteger isolatedStarts = new AtomicInteger();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "rust-routing-test-deadline");
+            thread.setDaemon(true);
+            return thread;
+        });
+        Path processExecutable = temporaryDirectory.resolve("hmcl-rust-host-process.exe");
+        Files.write(processExecutable, new byte[]{0x48, 0x4d, 0x43, 0x4c});
+        RustRuntimeEngine engine = new RustRuntimeEngine(
+                embedded,
+                processExecutable,
+                scheduler,
+                (executable, context, deadlines) -> {
+                    isolatedStarts.incrementAndGet();
+                    assertEquals(processExecutable, executable);
+                    assertEquals(PluginExecutionMode.ISOLATED, context.executionMode());
+                    assertSame(scheduler, deadlines);
+                    return isolated;
+                }
+        );
+        RuntimePayloadContext embeddedContext = routingContext(
+                "dev.hmclce.test.embedded-routing", PluginExecutionMode.EMBEDDED);
+        RuntimePayloadContext isolatedContext = routingContext(
+                "dev.hmclce.test.isolated-routing", PluginExecutionMode.ISOLATED);
+
+        engine.initialize();
+        assertTrue(engine.healthCheck());
+        String embeddedId = engine.loadPayload(embeddedContext);
+        String isolatedId = engine.loadPayload(isolatedContext);
+        engine.enablePayload(embeddedId);
+        engine.enablePayload(isolatedId);
+        assertArrayEquals(new byte[]{1},
+                engine.invokePayload(embeddedId, "embedded.call", new byte[]{1}, 11L));
+        assertArrayEquals(new byte[]{2},
+                engine.invokePayload(isolatedId, "isolated.call", new byte[]{2}, 13L));
+        assertEquals(Duration.ofSeconds(30L), isolated.invokedTimeout);
+        assertArrayEquals(new byte[]{3}, engine.invokePayload(
+                isolatedId, "hook.before-game-launch", new byte[]{3}, 0L, Duration.ofMillis(275L)));
+        engine.disablePayload(embeddedId);
+        engine.disablePayload(isolatedId);
+
+        assertEquals("1", embeddedId);
+        assertEquals("2", isolatedId);
+        assertEquals(1, isolatedStarts.get());
+        assertEquals(List.of("enable:native-41", "invoke:native-41:embedded.call:11", "disable:native-41"),
+                embedded.payloadEvents);
+        assertEquals(List.of("isolated:enable", "isolated:invoke:isolated.call:13",
+                "isolated:invoke:hook.before-game-launch:0", "isolated:disable"), isolated.events);
+        assertEquals(Duration.ofMillis(275L), isolated.invokedTimeout);
+        assertThrows(IOException.class, () -> engine.enablePayload("999"));
+
+        engine.close();
+        assertEquals(List.of("isolated:close", "embedded:close"), events);
+        assertTrue(scheduler.isShutdown());
+    }
+
     /// Hook dispatch must cross the native boundary as one exact language-neutral envelope.
     @Test
     void dispatchesHookThroughCanonicalNativeOperation() throws Exception {
@@ -285,6 +351,7 @@ final class RustRuntimeHostPluginTest {
         assertEquals("native-41", engine.invokedPayloadId);
         assertEquals("hook.before-game-launch", engine.invokedOperation);
         assertEquals(0L, engine.invokedCallbackId);
+        assertEquals(Duration.ofMillis(275L), engine.invokedTimeout);
         assertEquals(BridgeValue.map(expectedEvent), RuntimeBridgeWireCodec.decode(engine.invokedInput));
     }
 
@@ -605,6 +672,24 @@ final class RustRuntimeHostPluginTest {
         );
     }
 
+    /// Creates one payload context for hybrid backend routing without exposing token bytes.
+    ///
+    /// @param pluginId exact payload identity
+    /// @param mode selected execution mode
+    /// @return routing test context
+    private RuntimePayloadContext routingContext(String pluginId, PluginExecutionMode mode) {
+        return new RuntimePayloadContext(
+                new PluginArtifactIdentity(pluginId, "1.0.0", "f".repeat(64)),
+                temporaryDirectory,
+                "payload/plugin.dll",
+                mode,
+                temporaryDirectory.resolve("data"),
+                () -> {
+                    throw new AssertionError("Hybrid routing must not resolve Java capability token bytes");
+                }
+        );
+    }
+
     /// Creates one insertion-ordered Bridge map from alternating string keys and values.
     ///
     /// @param entries alternating string keys and Bridge values
@@ -680,6 +765,9 @@ final class RustRuntimeHostPluginTest {
         /// Callback identifier from the latest generic invocation.
         private long invokedCallbackId = Long.MIN_VALUE;
 
+        /// Dispatcher timeout observed by the timeout-aware invocation overload.
+        private @Nullable Duration invokedTimeout;
+
         /// Optional scripted result returned by the next and subsequent generic invocations.
         private byte @Nullable [] invocationResult;
 
@@ -726,6 +814,19 @@ final class RustRuntimeHostPluginTest {
             return invocationResult == null ? input.clone() : invocationResult.clone();
         }
 
+        /// Records a timeout-aware invocation before delegating to the ordinary fake boundary.
+        @Override
+        public byte[] invokePayload(
+                String payloadId,
+                String operation,
+                byte[] input,
+                long callbackId,
+                Duration timeout
+        ) {
+            invokedTimeout = timeout;
+            return invokePayload(payloadId, operation, input, callbackId);
+        }
+
         /// Records payload unload.
         @Override
         public void unloadPayload(String payloadId) {
@@ -738,6 +839,58 @@ final class RustRuntimeHostPluginTest {
             if (closeCalls++ == 0) {
                 closeEvent.run();
             }
+        }
+    }
+
+    /// In-memory isolated backend used to observe mode routing and deadlines.
+    @NotNullByDefault
+    private static final class FakeIsolatedPayload implements RustRuntimeEngine.IsolatedPayload {
+        /// Provider-wide close-order events.
+        private final List<String> closeEvents;
+
+        /// Isolated payload lifecycle and invocation events.
+        private final List<String> events = new ArrayList<>();
+
+        /// Last invocation timeout.
+        private @Nullable Duration invokedTimeout;
+
+        /// Creates one isolated backend recorder.
+        ///
+        /// @param closeEvents shared close-order events
+        private FakeIsolatedPayload(List<String> closeEvents) {
+            this.closeEvents = closeEvents;
+        }
+
+        /// Records isolated enablement.
+        @Override
+        public void enable() {
+            events.add("isolated:enable");
+        }
+
+        /// Records isolated invocation and echoes its input.
+        @Override
+        public byte[] invoke(String operation, byte[] input, long callbackId, Duration timeout) {
+            events.add("isolated:invoke:" + operation + ":" + callbackId);
+            invokedTimeout = timeout;
+            return input.clone();
+        }
+
+        /// Records isolated disablement.
+        @Override
+        public void disable() {
+            events.add("isolated:disable");
+        }
+
+        /// Records isolated shutdown.
+        @Override
+        public void shutdown() {
+            events.add("isolated:shutdown");
+        }
+
+        /// Records isolated close in provider-wide order.
+        @Override
+        public void close() {
+            closeEvents.add("isolated:close");
         }
     }
 

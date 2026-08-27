@@ -18,7 +18,7 @@ import java.util.function.Supplier;
 /// Java bootstrap for the separately packaged optional Rust Runtime Host.
 @NotNullByDefault
 public final class RustRuntimeHostPlugin implements Plugin {
-    /// Opens one platform-specific native engine from the package root.
+    /// Opens one platform-specific hybrid engine from the package root.
     private final EngineFactory engineFactory;
 
     /// Supplies the exact launcher platform used for artifact selection.
@@ -30,17 +30,17 @@ public final class RustRuntimeHostPlugin implements Plugin {
     /// Active Provider registration, if load completed.
     private @Nullable Registration registration;
 
-    /// Loaded native engine, if load completed.
+    /// Loaded hybrid engine, if load completed.
     private @Nullable RustRuntimeProvider.Engine engine;
 
-    /// Creates a production bootstrap using current-platform JNI loading.
+    /// Creates a production bootstrap using current-platform embedded and isolated artifacts.
     public RustRuntimeHostPlugin() {
-        this(RustNativeEngine::load, PluginPlatformTarget::current);
+        this(RustRuntimeEngine::load, PluginPlatformTarget::current);
     }
 
     /// Creates a bootstrap with injectable package boundaries for lifecycle tests.
     ///
-    /// @param engineFactory native engine factory
+    /// @param engineFactory hybrid engine factory
     /// @param platformSupplier exact platform supplier
     RustRuntimeHostPlugin(
             EngineFactory engineFactory,
@@ -50,7 +50,7 @@ public final class RustRuntimeHostPlugin implements Plugin {
         this.platformSupplier = platformSupplier;
     }
 
-    /// Loads the native library and publishes one manifest-matched Rust Provider.
+    /// Loads the runtime artifacts and publishes one manifest-matched Rust Provider.
     ///
     /// @param context launcher-owned plugin context
     @Override
@@ -176,16 +176,16 @@ public final class RustRuntimeHostPlugin implements Plugin {
         void close() throws IOException;
     }
 
-    /// Opens one exact platform native engine.
+    /// Opens one exact platform hybrid engine.
     @FunctionalInterface
     @NotNullByDefault
     interface EngineFactory {
-        /// Loads an engine from the extracted package.
+        /// Loads a hybrid engine from the extracted package.
         ///
         /// @param packageRoot extracted package root
         /// @param platform exact launcher platform
-        /// @return loaded native engine
-        /// @throws IOException if native loading fails
+        /// @return loaded hybrid engine
+        /// @throws IOException if runtime artifact loading fails
         RustRuntimeProvider.Engine open(Path packageRoot, PluginPlatformTarget platform) throws IOException;
     }
 

@@ -18,10 +18,10 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/// Publishes the Rust runtime declaration and delegates native lifecycle negotiation to its engine.
+/// Publishes the Rust runtime declaration and delegates embedded or isolated work to its engine.
 @NotNullByDefault
 public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvider.HookInvoker {
-    /// Native engine owned by this Provider registration.
+    /// Hybrid runtime engine owned by this Provider registration.
     private final Engine engine;
 
     /// Immutable descriptor whose identity and capabilities mirror the Host package manifest.
@@ -62,7 +62,7 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
         return descriptor;
     }
 
-    /// Creates provider-wide native state before health negotiation.
+    /// Creates provider-wide runtime state before health negotiation.
     ///
     /// @throws IOException if native initialization fails
     @Override
@@ -70,7 +70,7 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
         engine.initialize();
     }
 
-    /// Delegates readiness negotiation to the native engine.
+    /// Delegates readiness negotiation to the hybrid engine.
     ///
     /// @return whether the engine can accept payload work
     /// @throws IOException if native health negotiation fails
@@ -79,11 +79,11 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
         return engine.healthCheck();
     }
 
-    /// Loads one embedded Rust payload and wraps its native ID in a Provider-owned opaque handle.
+    /// Loads one Rust payload and wraps its Host ID in a Provider-owned opaque handle.
     ///
     /// @param context immutable payload loading context
     /// @return Provider-owned payload handle
-    /// @throws IOException if native loading or ABI negotiation fails
+    /// @throws IOException if backend loading or ABI negotiation fails
     @Override
     public RuntimePayloadHandle loadPayload(RuntimePayloadContext context) throws IOException {
         String payloadId = engine.loadPayload(context);
@@ -91,10 +91,10 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
                 context.artifactIdentity().getPluginId(), descriptor.providerId(), payloadId);
     }
 
-    /// Enables one loaded native payload.
+    /// Enables one loaded Rust payload.
     ///
     /// @param handle Provider-owned payload handle
-    /// @throws IOException if native initialization fails
+    /// @throws IOException if backend initialization fails
     @Override
     public void enablePayload(RuntimePayloadHandle handle) throws IOException {
         engine.enablePayload(requireOwnedHandle(handle));
@@ -154,11 +154,12 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
                 requireOwnedHandle(handle),
                 RuntimeHookWireCodec.operation(event.point()),
                 RuntimeHookWireCodec.encodeEvent(event),
-                0L
+                0L,
+                deadline
         ));
     }
 
-    /// Shuts down and unloads one disabled native payload.
+    /// Shuts down and unloads one disabled Rust payload.
     ///
     /// @param handle Provider-owned payload handle
     /// @throws IOException if native shutdown fails
@@ -180,7 +181,7 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
     /// Requires one handle issued by this exact Provider identity.
     ///
     /// @param handle candidate payload handle
-    /// @return opaque native payload ID
+    /// @return opaque Host payload ID
     /// @throws IOException if another Provider issued the handle
     private String requireOwnedHandle(RuntimePayloadHandle handle) throws IOException {
         if (!descriptor.providerId().equals(handle.providerId())) {
@@ -189,7 +190,7 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
         return handle.payloadId();
     }
 
-    /// Minimal engine lifecycle used by the Java Host and implemented by the JNI owner.
+    /// Minimal engine lifecycle used by the Java Host and implemented by the hybrid router.
     @NotNullByDefault
     interface Engine extends AutoCloseable {
         /// Creates provider-wide runtime state.
@@ -203,10 +204,10 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
         /// @throws IOException if negotiation fails
         boolean healthCheck() throws IOException;
 
-        /// Loads and negotiates one exact embedded payload without exposing Java token bytes.
+        /// Loads and negotiates one exact payload without exposing Java token bytes.
         ///
         /// @param context immutable payload context
-        /// @return opaque native payload ID
+        /// @return opaque Host payload ID
         /// @throws IOException if loading fails
         String loadPayload(RuntimePayloadContext context) throws IOException;
 
@@ -236,6 +237,28 @@ public final class RustRuntimeProvider implements RuntimeProvider, RuntimeProvid
                 byte[] input,
                 long callbackId
         ) throws IOException;
+
+        /// Invokes one raw-byte operation with a caller-owned positive deadline.
+        ///
+        /// Embedded engines retain their synchronous boundary while isolated engines override this method.
+        ///
+        /// @param payloadId opaque native payload ID
+        /// @param operation canonical payload operation
+        /// @param input canonical Bridge Value v1 bytes
+        /// @param callbackId payload-local callback ID
+        /// @param timeout positive operation deadline
+        /// @return canonical Bridge Value v1 result bytes
+        /// @throws IOException if invocation fails
+        default byte[] invokePayload(
+                String payloadId,
+                String operation,
+                byte[] input,
+                long callbackId,
+                Duration timeout
+        ) throws IOException {
+            Objects.requireNonNull(timeout, "timeout");
+            return invokePayload(payloadId, operation, input, callbackId);
+        }
 
         /// Shuts down and unloads one disabled payload.
         ///
