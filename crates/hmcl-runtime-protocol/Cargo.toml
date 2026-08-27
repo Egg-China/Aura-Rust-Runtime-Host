@@ -1,0 +1,12 @@
+[package]
+name = "hmcl-runtime-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hmcl-plugin-sdk = { path = "../hmcl-plugin-sdk" }
+
+[lints]
+workspace = true

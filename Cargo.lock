@@ -43,6 +43,13 @@ name = "hmcl-runtime-abi"
 version = "0.1.0"
 
 [[package]]
+name = "hmcl-runtime-protocol"
+version = "0.1.0"
+dependencies = [
+ "hmcl-plugin-sdk",
+]
+
+[[package]]
 name = "hmcl-rust-host-native"
 version = "0.1.0"
 dependencies = [

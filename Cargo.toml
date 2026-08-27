@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/hmcl-runtime-abi",
+    "crates/hmcl-runtime-protocol",
     "crates/hmcl-plugin-sdk",
     "crates/hmcl-rust-host-native",
 ]
