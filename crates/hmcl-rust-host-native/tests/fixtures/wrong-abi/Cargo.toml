@@ -1,0 +1,11 @@
+[package]
+name = "hmcl-wrong-abi-fixture"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hmcl-runtime-abi = { path = "../../../../hmcl-runtime-abi", default-features = false }

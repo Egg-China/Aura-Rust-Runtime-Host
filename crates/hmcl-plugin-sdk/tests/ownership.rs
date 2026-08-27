@@ -242,6 +242,34 @@ fn bridge_value_wire_v1_round_trips_every_value_and_preserves_map_order() {
 }
 
 #[test]
+fn bridge_value_wire_v1_matches_java_composite_fixture() {
+    let fixture = [
+        0x92, 0x07, 0xdd, 0x00, 0x00, 0x00, 0x03, 0x92, 0xdb, 0x00, 0x00, 0x00, 0x07, b'm', b'e',
+        b's', b's', b'a', b'g', b'e', 0x92, 0x04, 0xdb, 0x00, 0x00, 0x00, 0x04, b'A', b'u', b'r',
+        b'a', 0x92, 0xdb, 0x00, 0x00, 0x00, 0x06, b'h', b'a', b'n', b'd', b'l', b'e', 0x92, 0x08,
+        0x93, 0xcf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0xcf, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x03, 0xdb, 0x00, 0x00, 0x00, 0x07, b'u', b'i', b'.', b'p', b'a', b'g',
+        b'e', 0x92, 0xdb, 0x00, 0x00, 0x00, 0x05, b'e', b'r', b'r', b'o', b'r', 0x92, 0x09, 0xdb,
+        0x00, 0x00, 0x00, 0x11, b'p', b'e', b'r', b'm', b'i', b's', b's', b'i', b'o', b'n', b'-',
+        b'd', b'e', b'n', b'i', b'e', b'd',
+    ];
+    let expected = Value::Map(vec![
+        ("message".into(), Value::String("Aura".into())),
+        (
+            "handle".into(),
+            Value::Handle(HandleValue::new(9, 3, "ui.page").expect("valid handle")),
+        ),
+        (
+            "error".into(),
+            Value::Error(hmcl_plugin_sdk::Error::new(ErrorCode::PermissionDenied)),
+        ),
+    ]);
+
+    assert_eq!(expected.to_wire().expect("encodes fixture"), fixture);
+    assert_eq!(Value::from_wire(&fixture), Ok(expected));
+}
+
+#[test]
 fn bridge_errors_have_exact_java_parity_wire_codes() {
     let cases = [
         (ErrorCode::InvalidArgument, "invalid-argument"),

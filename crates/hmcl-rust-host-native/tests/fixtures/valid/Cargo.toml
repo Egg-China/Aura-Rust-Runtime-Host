@@ -1,0 +1,11 @@
+[package]
+name = "hmcl-embedded-fixture"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hmcl-plugin-sdk = { path = "../../../../hmcl-plugin-sdk" }

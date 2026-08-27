@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/hmcl-runtime-abi", "crates/hmcl-plugin-sdk"]
+members = [
+    "crates/hmcl-runtime-abi",
+    "crates/hmcl-plugin-sdk",
+    "crates/hmcl-rust-host-native",
+]
+exclude = ["crates/hmcl-rust-host-native/tests/fixtures"]
 resolver = "3"
 
 [workspace.package]
