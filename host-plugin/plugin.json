@@ -3,7 +3,7 @@
   "id": "dev.hmclce.runtime.rust-host",
   "name": "HMCL CE Rust Runtime Host",
   "version": "0.1.0",
-  "description": "Optional embedded Rust runtime provider for schema-v5 plugins.",
+  "description": "Optional embedded and isolated Rust runtime provider for schema-v5 plugins.",
   "author": "HMCL CE Community",
   "type": "java",
   "runtime": "java",
@@ -35,7 +35,8 @@
       "abis": [1],
       "bridgeAbi": 1,
       "executionModes": [
-        "embedded"
+        "embedded",
+        "isolated"
       ],
       "features": [
         "bridge",

@@ -78,6 +78,8 @@ final class RustRuntimeHostPluginTest {
         assertTrue(descriptor.enabled());
         assertFalse(descriptor.reserved());
         assertTrue(manifest.getProvidesRuntimes().get(0).getFeatures().contains(RuntimeFeature.HOOKS));
+        assertEquals(Set.of(PluginExecutionMode.EMBEDDED, PluginExecutionMode.ISOLATED),
+                manifest.getProvidesRuntimes().get(0).getExecutionModes());
     }
 
     /// Every supported build target must select one stable package-relative native engine path.
