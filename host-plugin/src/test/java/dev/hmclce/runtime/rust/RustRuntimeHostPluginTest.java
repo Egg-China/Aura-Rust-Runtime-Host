@@ -44,6 +44,7 @@ import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarFile;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -622,6 +623,122 @@ final class RustRuntimeHostPluginTest {
                 "release:7:9",
                 "dev.hmclce.test.real-jni:shutdown"
         ), calls);
+    }
+
+    /// The production process supervisor must drive an isolated Rust payload through Hooks and Bridge ownership.
+    @Test
+    void loadsIsolatedPayloadThroughRealProcessBridge() throws IOException {
+        String processArtifact = System.getenv("HMCL_RUST_PROCESS_HOST");
+        String fixtureArtifact = System.getenv("HMCL_RUST_EMBEDDED_FIXTURE");
+        assumeTrue(processArtifact != null && fixtureArtifact != null,
+                "Set process Host and embedded fixture artifacts to run isolated integration");
+        PluginPlatformTarget platform = PluginPlatformTarget.current();
+        Path integrationRoot = Path.of(
+                System.getProperty("hmcl.host.projectDir"),
+                "build",
+                "process-test",
+                UUID.randomUUID().toString()
+        );
+        Path processExecutable = integrationRoot.resolve(RustRuntimeEngine.processHostPath(platform));
+        Files.createDirectories(processExecutable.getParent());
+        Files.copy(
+                Path.of(processArtifact),
+                processExecutable,
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.COPY_ATTRIBUTES
+        );
+        Path payloadLibrary = integrationRoot.resolve("payload").resolve(Path.of(fixtureArtifact).getFileName());
+        Files.createDirectories(payloadLibrary.getParent());
+        Files.copy(Path.of(fixtureArtifact), payloadLibrary, StandardCopyOption.REPLACE_EXISTING);
+
+        List<String> calls = new ArrayList<>();
+        AtomicInteger tokenSupplierCalls = new AtomicInteger();
+        AtomicReference<Process> child = new AtomicReference<>();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "rust-real-process-test-deadline");
+            thread.setDaemon(true);
+            return thread;
+        });
+        RustRuntimeEngine engine = new RustRuntimeEngine(
+                new FakeEngine(),
+                RustRuntimeEngine.resolveProcessHost(integrationRoot, platform),
+                scheduler,
+                (executable, context, deadlines) -> RustIsolatedPayload.start(
+                        executable,
+                        context,
+                        builder -> {
+                            Process process = builder.start();
+                            child.set(process);
+                            return process;
+                        },
+                        deadlines
+                )
+        );
+        RuntimePayloadContext context = new RuntimePayloadContext(
+                new PluginArtifactIdentity("dev.hmclce.test.real-process", "1.0.0", "b".repeat(64)),
+                integrationRoot,
+                "payload/" + payloadLibrary.getFileName(),
+                PluginExecutionMode.ISOLATED,
+                integrationRoot.resolve("data"),
+                () -> {
+                    tokenSupplierCalls.incrementAndGet();
+                    throw new AssertionError("Isolated process must not resolve Java capability token bytes");
+                },
+                new RuntimeBridgeTransport() {
+                    @Override
+                    public byte[] invoke(RuntimePayloadContext current, String operation, byte[] input) {
+                        calls.add(current.artifactIdentity().getPluginId() + ":" + operation);
+                        return input.clone();
+                    }
+
+                    @Override
+                    public void retainHandle(RuntimePayloadContext current, long objectId, long generation) {
+                        calls.add("retain:" + objectId + ":" + generation);
+                    }
+
+                    @Override
+                    public void releaseHandle(RuntimePayloadContext current, long objectId, long generation) {
+                        calls.add("release:" + objectId + ":" + generation);
+                    }
+                }
+        );
+
+        try {
+            engine.initialize();
+            String payload = engine.loadPayload(context);
+            engine.enablePayload(payload);
+            byte[] hookInput = hookWire(mapOf(
+                    "contractVersion", BridgeValue.integer(1L),
+                    "dispatchId", BridgeValue.string("dispatch-rust-process-42"),
+                    "point", BridgeValue.string("before-game-launch"),
+                    "occurredAt", BridgeValue.string("2026-08-27T12:34:56Z"),
+                    "data", BridgeValue.map(mapOf("enabled", BridgeValue.bool(true)))
+            ));
+            assertArrayEquals(hookInput, engine.invokePayload(
+                    payload, "hook.before-game-launch", hookInput, 0L, Duration.ofSeconds(2L)));
+            byte[] wireHandle = {
+                    (byte) 0x92, 0x08, (byte) 0x93,
+                    (byte) 0xcf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+                    (byte) 0xcf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
+                    (byte) 0xdb, 0x00, 0x00, 0x00, 0x07, 'u', 'i', '.', 'p', 'a', 'g', 'e'
+            };
+            assertArrayEquals(wireHandle, engine.invokePayload(
+                    payload, "handle", wireHandle, 43L, Duration.ofSeconds(2L)));
+            engine.disablePayload(payload);
+            engine.unloadPayload(payload);
+
+            Process startedChild = child.get();
+            assertTrue(startedChild != null && !startedChild.isAlive());
+            assertEquals(0, tokenSupplierCalls.get());
+            assertEquals(List.of(
+                    "dev.hmclce.test.real-process:initialize",
+                    "retain:7:9",
+                    "release:7:9",
+                    "dev.hmclce.test.real-process:shutdown"
+            ), calls);
+        } finally {
+            engine.close();
+        }
     }
 
     /// The launcher distribution must not bundle this optional Host or any Rust native engine.
