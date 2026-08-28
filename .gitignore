@@ -1,5 +1,6 @@
 /.ci/
 /.gradle/
+/.worktrees/
 /build/
 /host-plugin/.gradle/
 /host-plugin/build/
