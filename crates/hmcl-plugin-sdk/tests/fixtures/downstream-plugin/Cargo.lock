@@ -11,11 +11,11 @@ dependencies = [
 
 [[package]]
 name = "hmcl-plugin-sdk"
-version = "0.1.0-beta.1"
+version = "0.2.0-beta.1"
 dependencies = [
  "hmcl-runtime-abi",
 ]
 
 [[package]]
 name = "hmcl-runtime-abi"
-version = "0.1.0-beta.1"
+version = "0.2.0-beta.1"

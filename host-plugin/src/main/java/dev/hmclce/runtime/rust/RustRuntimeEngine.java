@@ -3,6 +3,7 @@ package dev.hmclce.runtime.rust;
 import org.jackhuang.hmcl.plugin.runtime.PluginExecutionMode;
 import org.jackhuang.hmcl.plugin.runtime.PluginPlatformTarget;
 import org.jackhuang.hmcl.plugin.runtime.RuntimePayloadContext;
+import org.jackhuang.hmcl.plugin.runtime.process.RuntimeProcessSession;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
 
@@ -15,8 +16,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 
 /// Routes schema-v5 Rust payloads to embedded JNI or one isolated process per payload.
 @NotNullByDefault
@@ -29,9 +28,6 @@ public final class RustRuntimeEngine implements RustRuntimeProvider.Engine {
 
     /// Canonical isolated process Host executable.
     private final Path processExecutable;
-
-    /// Shared daemon deadline scheduler for isolated payload supervisors.
-    private final ScheduledExecutorService scheduler;
 
     /// Injectable isolated payload process boundary.
     private final IsolatedPayloadFactory isolatedFactory;
@@ -49,17 +45,14 @@ public final class RustRuntimeEngine implements RustRuntimeProvider.Engine {
     ///
     /// @param embeddedEngine provider-wide embedded engine
     /// @param processExecutable exact isolated process executable
-    /// @param scheduler shared isolated deadline scheduler
     /// @param isolatedFactory isolated payload starter
     RustRuntimeEngine(
             RustRuntimeProvider.Engine embeddedEngine,
             Path processExecutable,
-            ScheduledExecutorService scheduler,
             IsolatedPayloadFactory isolatedFactory
     ) {
         this.embeddedEngine = embeddedEngine;
         this.processExecutable = processExecutable;
-        this.scheduler = scheduler;
         this.isolatedFactory = isolatedFactory;
     }
 
@@ -72,18 +65,21 @@ public final class RustRuntimeEngine implements RustRuntimeProvider.Engine {
     static RustRuntimeEngine load(Path packageRoot, PluginPlatformTarget platform) throws IOException {
         Path processExecutable = resolveProcessHost(packageRoot, platform);
         RustNativeEngine embeddedEngine = RustNativeEngine.load(packageRoot, platform);
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "rust-isolated-runtime-deadline");
-            thread.setDaemon(true);
-            return thread;
-        });
         return new RustRuntimeEngine(
                 embeddedEngine,
                 processExecutable,
-                scheduler,
-                (executable, context, deadlines) -> RustIsolatedPayload.start(
-                        executable, context, ProcessBuilder::start, deadlines)
+                RustRuntimeEngine::startProcessPayload
         );
+    }
+
+    /// Starts one isolated payload through Aura's shared process session.
+    ///
+    /// @param executable canonical process Host executable
+    /// @param context exact isolated payload context
+    /// @return loaded process-backed payload
+    /// @throws IOException if process startup, negotiation, or loading fails
+    static IsolatedPayload startProcessPayload(Path executable, RuntimePayloadContext context) throws IOException {
+        return new SessionPayload(RuntimeProcessSession.start(executable, context));
     }
 
     /// Returns the stable package-relative isolated executable path for one release target.
@@ -165,7 +161,7 @@ public final class RustRuntimeEngine implements RustRuntimeProvider.Engine {
         if (context.executionMode() == PluginExecutionMode.EMBEDDED) {
             backend = new EmbeddedPayload(embeddedEngine.loadPayload(context));
         } else if (context.executionMode() == PluginExecutionMode.ISOLATED) {
-            backend = new IsolatedPayloadBackend(isolatedFactory.start(processExecutable, context, scheduler));
+            backend = new IsolatedPayloadBackend(isolatedFactory.start(processExecutable, context));
         } else {
             throw new IOException("Unsupported Rust payload execution mode: " + context.executionMode());
         }
@@ -286,11 +282,7 @@ public final class RustRuntimeEngine implements RustRuntimeProvider.Engine {
             }
         }
         payloads.clear();
-        try {
-            embeddedEngine.close();
-        } finally {
-            scheduler.shutdownNow();
-        }
+        embeddedEngine.close();
     }
 
     /// Allocates one positive Host-generated public payload identifier.
@@ -357,14 +349,53 @@ public final class RustRuntimeEngine implements RustRuntimeProvider.Engine {
         ///
         /// @param executable canonical process Host executable
         /// @param context exact isolated payload context
-        /// @param scheduler shared deadline scheduler
         /// @return started and loaded isolated payload
         /// @throws IOException if process startup or loading fails
         IsolatedPayload start(
                 Path executable,
-                RuntimePayloadContext context,
-                ScheduledExecutorService scheduler
+                RuntimePayloadContext context
         ) throws IOException;
+    }
+
+    /// Adapts Aura's language-neutral process session to the Rust backend router.
+    ///
+    /// @param session launcher-owned process session
+    @NotNullByDefault
+    private record SessionPayload(RuntimeProcessSession session) implements IsolatedPayload {
+        /// Rejects a null session from a broken launcher boundary.
+        private SessionPayload {
+            Objects.requireNonNull(session, "session");
+        }
+
+        /// Enables the loaded process payload.
+        @Override
+        public void enable() throws IOException {
+            session.enable();
+        }
+
+        /// Invokes one process payload operation with the exact caller deadline.
+        @Override
+        public byte[] invoke(String operation, byte[] input, long callbackId, Duration timeout) throws IOException {
+            return session.invoke(operation, input, callbackId, timeout);
+        }
+
+        /// Disables the enabled process payload.
+        @Override
+        public void disable() throws IOException {
+            session.disable();
+        }
+
+        /// Shuts down the payload and terminates its process.
+        @Override
+        public void shutdown() throws IOException {
+            session.shutdown();
+        }
+
+        /// Terminates the process session idempotently.
+        @Override
+        public void close() {
+            session.close();
+        }
     }
 
     /// Selects one closed backend representation.

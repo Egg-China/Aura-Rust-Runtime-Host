@@ -45,7 +45,7 @@ val nativePlatform = providers.environmentVariable("HMCL_RUST_PLATFORM")
 
 tasks.register<Zip>("packageNpl") {
     dependsOn(tasks.jar)
-    archiveFileName.set("dev.hmclce.runtime.rust-host-v0.1.0-beta.1.npl")
+    archiveFileName.set("dev.hmclce.runtime.rust-host-v0.2.0-beta.1.npl")
     destinationDirectory.set(layout.buildDirectory.dir("npl"))
     from("plugin.json")
     into("libs") {

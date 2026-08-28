@@ -13,12 +13,12 @@ $manifest = Get-Content -LiteralPath (Join-Path $root 'host-plugin/plugin.json')
 Assert-Equal 5 $manifest.schemaVersion 'Rust Host must use plugin manifest schema v5'
 Assert-Equal 'dev.hmclce.runtime.rust-host' $manifest.id 'Rust Host compatibility ID changed'
 Assert-Equal 'Aura Rust Runtime Host' $manifest.name 'Rust Host display identity is not Aura'
-Assert-Equal '0.1.0-beta.1' $manifest.version 'Rust Host release version is inconsistent'
-Assert-Equal '>=26.8-0-next' $manifest.launcherVersion 'Rust Host launcher constraint is inconsistent'
+Assert-Equal '0.2.0-beta.1' $manifest.version 'Rust Host release version is inconsistent'
+Assert-Equal '>=27.1-0-next' $manifest.launcherVersion 'Rust Host launcher constraint is inconsistent'
 
 $build = Get-Content -LiteralPath (Join-Path $root 'host-plugin/build.gradle.kts') -Raw
-if ($build -cnotmatch 'dev\.hmclce\.runtime\.rust-host-v0\.1\.0-beta\.1\.npl') {
-    throw 'Rust Host NPL filename does not contain version 0.1.0-beta.1'
+if ($build -cnotmatch 'dev\.hmclce\.runtime\.rust-host-v0\.2\.0-beta\.1\.npl') {
+    throw 'Rust Host NPL filename does not contain version 0.2.0-beta.1'
 }
 
 $crateManifests = @(
@@ -31,7 +31,7 @@ $crateManifests = @(
 foreach ($crateManifest in $crateManifests) {
     $path = Join-Path $root $crateManifest
     $content = Get-Content -LiteralPath $path -Raw
-    if ($content -cnotmatch '(?m)^version = "0\.1\.0-beta\.1"$') {
+    if ($content -cnotmatch '(?m)^version = "0\.2\.0-beta\.1"$') {
         throw "Rust crate version is inconsistent: $path"
     }
 }
