@@ -41,10 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarFile;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -187,8 +184,9 @@ final class RustRuntimeHostPluginTest {
     void propagatesHealthFailureAndClosesEngineOnce() throws IOException {
         FakeEngine engine = new FakeEngine();
         engine.healthy = false;
+        PluginManifest manifest = readManifest();
         RustRuntimeProvider provider = new RustRuntimeProvider(
-                readManifest().getId(), "0.1.0-beta.1", readManifest().getProvidesRuntimes(), engine);
+                manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
 
         provider.initialize();
         assertFalse(provider.healthCheck());
@@ -267,22 +265,15 @@ final class RustRuntimeHostPluginTest {
         embedded.closeEvent = () -> events.add("embedded:close");
         FakeIsolatedPayload isolated = new FakeIsolatedPayload(events);
         AtomicInteger isolatedStarts = new AtomicInteger();
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "rust-routing-test-deadline");
-            thread.setDaemon(true);
-            return thread;
-        });
         Path processExecutable = temporaryDirectory.resolve("hmcl-rust-host-process.exe");
         Files.write(processExecutable, new byte[]{0x48, 0x4d, 0x43, 0x4c});
         RustRuntimeEngine engine = new RustRuntimeEngine(
                 embedded,
                 processExecutable,
-                scheduler,
-                (executable, context, deadlines) -> {
+                (executable, context) -> {
                     isolatedStarts.incrementAndGet();
                     assertEquals(processExecutable, executable);
                     assertEquals(PluginExecutionMode.ISOLATED, context.executionMode());
-                    assertSame(scheduler, deadlines);
                     return isolated;
                 }
         );
@@ -319,7 +310,6 @@ final class RustRuntimeHostPluginTest {
 
         engine.close();
         assertEquals(List.of("isolated:close", "embedded:close"), events);
-        assertTrue(scheduler.isShutdown());
     }
 
     /// Hook dispatch must cross the native boundary as one exact language-neutral envelope.
@@ -625,7 +615,7 @@ final class RustRuntimeHostPluginTest {
         ), calls);
     }
 
-    /// The production process supervisor must drive an isolated Rust payload through Hooks and Bridge ownership.
+    /// Aura's process session must drive an isolated Rust payload through Hooks and Bridge ownership.
     @Test
     void loadsIsolatedPayloadThroughRealProcessBridge() throws IOException {
         String processArtifact = System.getenv("HMCL_RUST_PROCESS_HOST");
@@ -653,26 +643,10 @@ final class RustRuntimeHostPluginTest {
 
         List<String> calls = new ArrayList<>();
         AtomicInteger tokenSupplierCalls = new AtomicInteger();
-        AtomicReference<Process> child = new AtomicReference<>();
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "rust-real-process-test-deadline");
-            thread.setDaemon(true);
-            return thread;
-        });
         RustRuntimeEngine engine = new RustRuntimeEngine(
                 new FakeEngine(),
                 RustRuntimeEngine.resolveProcessHost(integrationRoot, platform),
-                scheduler,
-                (executable, context, deadlines) -> RustIsolatedPayload.start(
-                        executable,
-                        context,
-                        builder -> {
-                            Process process = builder.start();
-                            child.set(process);
-                            return process;
-                        },
-                        deadlines
-                )
+                RustRuntimeEngine::startProcessPayload
         );
         RuntimePayloadContext context = new RuntimePayloadContext(
                 new PluginArtifactIdentity("dev.hmclce.test.real-process", "1.0.0", "b".repeat(64)),
@@ -727,8 +701,6 @@ final class RustRuntimeHostPluginTest {
             engine.disablePayload(payload);
             engine.unloadPayload(payload);
 
-            Process startedChild = child.get();
-            assertTrue(startedChild != null && !startedChild.isAlive());
             assertEquals(0, tokenSupplierCalls.get());
             assertEquals(List.of(
                     "dev.hmclce.test.real-process:initialize",

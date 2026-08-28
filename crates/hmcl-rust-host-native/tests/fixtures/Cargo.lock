@@ -15,14 +15,14 @@ version = "0.0.0"
 
 [[package]]
 name = "hmcl-plugin-sdk"
-version = "0.1.0-beta.1"
+version = "0.2.0-beta.1"
 dependencies = [
  "hmcl-runtime-abi",
 ]
 
 [[package]]
 name = "hmcl-runtime-abi"
-version = "0.1.0-beta.1"
+version = "0.2.0-beta.1"
 
 [[package]]
 name = "hmcl-wrong-abi-fixture"

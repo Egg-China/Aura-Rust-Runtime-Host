@@ -25,5 +25,5 @@
     "before-game-launch"
   ],
   "patches": [],
-  "launcherVersion": ">=26.8-0-next"
+  "launcherVersion": ">=27.1-0-next"
 }

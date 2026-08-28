@@ -6,7 +6,7 @@ The compatibility identifiers `dev.hmclce.runtime.rust-host` and `dev.hmclce` re
 
 ## Requirements
 
-- Aura Launcher `26.8` Next or newer
+- Aura Launcher `27.1` Next or newer
 - Java 17 or newer
 - A platform package matching Windows, Linux, or macOS on x64 or ARM64
 
@@ -21,7 +21,7 @@ cargo test --workspace
 Java Provider tests compile against an exact Aura Launcher Shadow JAR:
 
 ```powershell
-$env:HMCL_JAR = 'C:\path\to\Aura-Launcher-26.8.SNAPSHOT-next.jar'
+$env:HMCL_JAR = 'C:\path\to\Aura-Launcher-27.1.SNAPSHOT-next.jar'
 & C:\path\to\Aura-Launcher\gradlew.bat -p host-plugin test --no-daemon
 ```
 
