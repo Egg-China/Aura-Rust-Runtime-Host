@@ -1,0 +1,13 @@
+[package]
+name = "hmcl-rust-launch-hook"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hmcl-plugin-sdk = { path = "../../runtime-hosts/rust/crates/hmcl-plugin-sdk" }

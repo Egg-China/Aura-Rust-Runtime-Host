@@ -1,8 +1,8 @@
 {
   "schemaVersion": 5,
   "id": "dev.hmclce.runtime.rust-host",
-  "name": "HMCL CE Rust Runtime Host",
-  "version": "0.1.0",
+  "name": "Aura Rust Runtime Host",
+  "version": "0.1.0-beta.1",
   "description": "Optional embedded and isolated Rust runtime provider for schema-v5 plugins.",
   "author": "HMCL CE Community",
   "type": "java",
@@ -28,7 +28,7 @@
   ],
   "hooks": [],
   "patches": [],
-  "launcherVersion": ">=26.8",
+  "launcherVersion": ">=26.8-0-next",
   "providesRuntimes": [
     {
       "runtime": "rust",

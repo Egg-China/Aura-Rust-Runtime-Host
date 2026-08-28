@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 5,
+  "id": "dev.hmclce.example.rust.launch-hook",
+  "name": "Rust Game Launch Hook Plugin",
+  "version": "1.0.0",
+  "description": "Isolated Rust example that observes the before-game-launch Hook.",
+  "author": "HMCL CE Community",
+  "type": "java",
+  "runtime": "rust",
+  "abi": 1,
+  "platforms": [
+    "windows-x64"
+  ],
+  "entrypoint": "payload/hmcl_rust_launch_hook.dll",
+  "executionMode": "isolated",
+  "runtimeProvider": "dev.hmclce.runtime.rust-host",
+  "dependencies": [],
+  "permissions": [
+    "launcher-hook"
+  ],
+  "requiredPermissions": [
+    "launcher-hook"
+  ],
+  "hooks": [
+    "before-game-launch"
+  ],
+  "patches": [],
+  "launcherVersion": ">=26.8-0-next"
+}

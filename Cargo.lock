@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "hmcl-plugin-sdk"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "hmcl-runtime-abi",
  "libloading",
@@ -40,18 +40,18 @@ dependencies = [
 
 [[package]]
 name = "hmcl-runtime-abi"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "hmcl-runtime-protocol"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "hmcl-plugin-sdk",
 ]
 
 [[package]]
 name = "hmcl-rust-host-native"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "hmcl-plugin-sdk",
  "hmcl-runtime-abi",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "hmcl-rust-host-process"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "hmcl-plugin-sdk",
  "hmcl-runtime-protocol",

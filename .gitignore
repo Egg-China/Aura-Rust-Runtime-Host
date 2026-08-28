@@ -1,0 +1,7 @@
+/.ci/
+/.gradle/
+/build/
+/host-plugin/.gradle/
+/host-plugin/build/
+target/
+/examples/launch-hook/target/

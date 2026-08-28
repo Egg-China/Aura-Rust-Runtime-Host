@@ -188,7 +188,7 @@ final class RustRuntimeHostPluginTest {
         FakeEngine engine = new FakeEngine();
         engine.healthy = false;
         RustRuntimeProvider provider = new RustRuntimeProvider(
-                readManifest().getId(), "0.1.0", readManifest().getProvidesRuntimes(), engine);
+                readManifest().getId(), "0.1.0-beta.1", readManifest().getProvidesRuntimes(), engine);
 
         provider.initialize();
         assertFalse(provider.healthCheck());

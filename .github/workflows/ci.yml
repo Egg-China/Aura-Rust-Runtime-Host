@@ -1,0 +1,290 @@
+name: Rust Runtime Host
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/ci.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**'
+      - 'host-plugin/**'
+      - 'rust-toolchain.toml'
+      - 'tools/verify-rust-host-artifacts.ps1'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  AURA_REPOSITORY: Egg-China/Aura-Launcher
+  AURA_WORKFLOW: gradle.yml
+  AURA_HEAD_SHA: 2ba6c34437fef289b11c40f45c87221578e65ef0
+  AURA_RUN_ID: 33098318102
+  SDK_REPOSITORY: HMCL-Community/HMCL-CE-Plugin-SDK
+  SDK_SHA: 05d687fb8bd8a9683113c5e4317e9aca2b6d7112
+  HOST_VERSION: 0.1.0-beta.1
+  RUST_TOOLCHAIN: 1.97.1
+
+jobs:
+  resolve_aura:
+    name: Resolve Aura Next build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+    steps:
+      - name: Resolve exact successful Aura main build
+        id: resolve
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AURA_REPOSITORY_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+              throw 'AURA_REPOSITORY_TOKEN is required to access the private Aura repository'
+          }
+          $resolved = gh api --method GET `
+              "repos/$env:AURA_REPOSITORY/actions/runs/$env:AURA_RUN_ID" | ConvertFrom-Json
+          if ($resolved.head_branch -cne 'main' `
+                  -or $resolved.head_sha -cne $env:AURA_HEAD_SHA `
+                  -or $resolved.conclusion -cne 'success' `
+                  -or $resolved.path -notlike "*$env:AURA_WORKFLOW*") {
+              throw 'Pinned Aura workflow run does not match the required successful main build'
+          }
+          "head_sha=$($resolved.head_sha)" >> $env:GITHUB_OUTPUT
+          "run_id=$($resolved.id)" >> $env:GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: resolve_aura
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2025, platform: windows-x64, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, platform: windows-arm64, target: aarch64-pc-windows-msvc }
+          - { runner: ubuntu-24.04, platform: linux-x64, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-15-intel, platform: macos-x64, target: x86_64-apple-darwin }
+          - { runner: macos-15, platform: macos-arm64, target: aarch64-apple-darwin }
+    steps:
+      - name: Check out Rust Host
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Check out exact Plugin SDK validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.SDK_REPOSITORY }}
+          ref: ${{ env.SDK_SHA }}
+          path: .ci/sdk
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Set up Gradle 9.6.1
+        uses: gradle/actions/setup-gradle@4c125117fe7c5aed11272ec4213f602f012f89f2 # v5
+        with:
+          gradle-version: '9.6.1'
+          cache-cleanup: never
+
+      - name: Set up Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN `
+              --profile minimal `
+              --component rustfmt `
+              --component clippy `
+              --target '${{ matrix.target }}'
+          rustup override set $env:RUST_TOOLCHAIN
+          rustc --version
+
+      - name: Check Rust formatting
+        shell: pwsh
+        run: cargo fmt --all --check
+
+      - name: Lint and test native target
+        shell: pwsh
+        run: |
+          cargo clippy `
+              --workspace --all-targets --target '${{ matrix.target }}' -- -D warnings
+          cargo test `
+              --workspace --target '${{ matrix.target }}'
+
+      - name: Build release artifacts
+        shell: pwsh
+        run: |
+          cargo build `
+              --release --target '${{ matrix.target }}' `
+              -p hmcl-rust-host-native -p hmcl-rust-host-process
+
+      - name: Download exact Aura Next JAR
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AURA_REPOSITORY_TOKEN }}
+          AURA_HEAD_SHA: ${{ needs.resolve_aura.outputs.head_sha }}
+          AURA_RUN_ID: ${{ needs.resolve_aura.outputs.run_id }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+              throw 'AURA_REPOSITORY_TOKEN is required to access the private Aura repository'
+          }
+          $artifactName = "Aura-Launcher-$env:AURA_HEAD_SHA"
+          gh run download $env:AURA_RUN_ID `
+              --repo $env:AURA_REPOSITORY `
+              --name $artifactName `
+              --dir .ci/aura
+          $jars = @(Get-ChildItem .ci/aura -Recurse -File -Filter 'Aura-Launcher-*-next.jar')
+          if ($jars.Count -ne 1) {
+              throw "Expected exactly one Aura Next Shadow JAR, found $($jars.Count)"
+          }
+          "HMCL_JAR=$($jars[0].FullName)" >> $env:GITHUB_ENV
+
+      - name: Resolve native artifact paths
+        shell: pwsh
+        run: |
+          $release = Join-Path 'target' '${{ matrix.target }}/release'
+          if ('${{ matrix.platform }}'.StartsWith('windows-')) {
+              $native = Join-Path $release 'hmcl_rust_host_native.dll'
+              $process = Join-Path $release 'hmcl-rust-host-process.exe'
+          } elseif ('${{ matrix.platform }}'.StartsWith('linux-')) {
+              $native = Join-Path $release 'libhmcl_rust_host_native.so'
+              $process = Join-Path $release 'hmcl-rust-host-process'
+          } else {
+              $native = Join-Path $release 'libhmcl_rust_host_native.dylib'
+              $process = Join-Path $release 'hmcl-rust-host-process'
+          }
+          if (-not (Test-Path -LiteralPath $native -PathType Leaf)) {
+              throw "Native library was not built: $native"
+          }
+          if (-not (Test-Path -LiteralPath $process -PathType Leaf)) {
+              throw "Process Host was not built: $process"
+          }
+          "HMCL_RUST_NATIVE_LIBRARY=$((Resolve-Path -LiteralPath $native).Path)" >> $env:GITHUB_ENV
+          "HMCL_RUST_PROCESS_HOST=$((Resolve-Path -LiteralPath $process).Path)" >> $env:GITHUB_ENV
+          "HMCL_RUST_PLATFORM=${{ matrix.platform }}" >> $env:GITHUB_ENV
+
+      - name: Package and validate NPL
+        shell: pwsh
+        run: |
+          gradle -p host-plugin test packageNpl --no-daemon --stacktrace
+          $package = Resolve-Path `
+              "host-plugin/build/npl/dev.hmclce.runtime.rust-host-v$env:HOST_VERSION.npl"
+          & ./.ci/sdk/tools/validate-npl.ps1 -Package $package
+          [void](New-Item -ItemType Directory -Path .ci/output -Force)
+          $publishedPackage = Join-Path .ci/output `
+              "dev.hmclce.runtime.rust-host-v$env:HOST_VERSION-${{ matrix.platform }}.npl"
+          Copy-Item -LiteralPath $package -Destination $publishedPackage
+          & ./tools/verify-rust-host-artifacts.ps1 `
+              -Platform '${{ matrix.platform }}' `
+              -NativeLibrary $env:HMCL_RUST_NATIVE_LIBRARY `
+              -ProcessHost $env:HMCL_RUST_PROCESS_HOST `
+              -Package $publishedPackage `
+              -Output '.ci/output/rust-runtime-host-${{ matrix.platform }}.json'
+
+      - name: Upload immutable platform artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rust-runtime-host-${{ matrix.platform }}
+          path: .ci/output/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  manifest:
+    name: Merge artifact manifest
+    needs:
+      - resolve_aura
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download platform records
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $platforms = @(
+              'windows-x64',
+              'windows-arm64',
+              'linux-x64',
+              'linux-arm64',
+              'macos-x64',
+              'macos-arm64'
+          )
+          foreach ($platform in $platforms) {
+              gh run download $env:GITHUB_RUN_ID `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --name "rust-runtime-host-$platform" `
+                  --dir ".ci/platforms/$platform"
+          }
+
+      - name: Validate and merge records
+        shell: pwsh
+        env:
+          AURA_HEAD_SHA: ${{ needs.resolve_aura.outputs.head_sha }}
+          AURA_RUN_ID: ${{ needs.resolve_aura.outputs.run_id }}
+        run: |
+          $expectedPlatforms = @(
+              'linux-arm64',
+              'linux-x64',
+              'macos-arm64',
+              'macos-x64',
+              'windows-arm64',
+              'windows-x64'
+          )
+          $recordFiles = @(Get-ChildItem .ci/platforms -Recurse -File `
+              -Filter 'rust-runtime-host-*.json')
+          if ($recordFiles.Count -ne 6) {
+              throw "Expected exactly six artifact records, found $($recordFiles.Count)"
+          }
+          $records = @($recordFiles | ForEach-Object {
+              Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+          } | Sort-Object platform)
+          $actualPlatforms = @($records | ForEach-Object { [string]$_.platform })
+          if (($actualPlatforms | Select-Object -Unique).Count -ne 6) {
+              throw 'Rust Host artifact platforms must be unique'
+          }
+          if ((Compare-Object $expectedPlatforms $actualPlatforms).Count -ne 0) {
+              throw 'Rust Host artifact manifest does not contain the exact six-platform set'
+          }
+          foreach ($record in $records) {
+              if ([string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                  throw "Invalid SHA-256 for $($record.platform)"
+              }
+              if ([int64]$record.size -le 0) {
+                  throw "Invalid package size for $($record.platform)"
+              }
+          }
+          $manifest = [pscustomobject][ordered]@{
+              schemaVersion = 1
+              runtimeHost = 'dev.hmclce.runtime.rust-host'
+              version = $env:HOST_VERSION
+              aura = [pscustomobject][ordered]@{
+                  repository = $env:AURA_REPOSITORY
+                  headSha = $env:AURA_HEAD_SHA
+                  runId = [int64]$env:AURA_RUN_ID
+              }
+              artifacts = $records
+          }
+          [void](New-Item -ItemType Directory -Path .ci/manifest -Force)
+          $json = $manifest | ConvertTo-Json -Depth 8
+          [System.IO.File]::WriteAllText(
+              (Join-Path $PWD '.ci/manifest/rust-runtime-host-manifest.json'),
+              $json + "`n",
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Upload merged manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rust-runtime-host-manifest
+          path: .ci/manifest/rust-runtime-host-manifest.json
+          if-no-files-found: error
+          retention-days: 30
