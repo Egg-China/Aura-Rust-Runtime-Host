@@ -89,6 +89,89 @@
       ],
       "releaseNotes": "First Aura Next beta with embedded JNI and isolated process execution.",
       "releaseDate": "2026-08-28"
+    },
+    {
+      "version": "0.2.0-beta.1",
+      "launcherVersion": ">=27.1-0-next",
+      "requiredJavaVersion": "17",
+      "pluginApiVersion": 5,
+      "runtime": "java",
+      "abi": 2,
+      "platforms": [
+        "windows-x64",
+        "windows-arm64",
+        "linux-x64",
+        "linux-arm64",
+        "macos-x64",
+        "macos-arm64"
+      ],
+      "pluginKind": "runtime-provider",
+      "executionMode": "embedded",
+      "providesRuntimes": [
+        {
+          "runtime": "rust",
+          "abis": [1],
+          "bridgeAbi": 1,
+          "executionModes": [
+            "embedded",
+            "isolated"
+          ],
+          "features": [
+            "bridge",
+            "hooks",
+            "native"
+          ]
+        }
+      ],
+      "permissions": [
+        "native-code"
+      ],
+      "requiredPermissions": [
+        "native-code"
+      ],
+      "dependencies": [],
+      "requiresRestart": false,
+      "channel": "beta",
+      "artifacts": [
+        {
+          "platform": "windows-x64",
+          "packageUrl": "https://github.com/Egg-China/Aura-Rust-Runtime-Host/releases/download/v0.2.0-beta.1/dev.hmclce.runtime.rust-host-v0.2.0-beta.1-windows-x64.npl",
+          "sha256": "2d495681d70e5ce00b9a9e2947add3bcb423974d2b5d499a52eafea4f95a195d",
+          "size": 298827
+        },
+        {
+          "platform": "windows-arm64",
+          "packageUrl": "https://github.com/Egg-China/Aura-Rust-Runtime-Host/releases/download/v0.2.0-beta.1/dev.hmclce.runtime.rust-host-v0.2.0-beta.1-windows-arm64.npl",
+          "sha256": "cb85988c47c013729302249701f39c0a27e22e1bba67635df38ba7c33500caa9",
+          "size": 287617
+        },
+        {
+          "platform": "linux-x64",
+          "packageUrl": "https://github.com/Egg-China/Aura-Rust-Runtime-Host/releases/download/v0.2.0-beta.1/dev.hmclce.runtime.rust-host-v0.2.0-beta.1-linux-x64.npl",
+          "sha256": "9c991e60f6769f7e08c33ac4d91cbd399b5204024c770e996c780078d490394c",
+          "size": 548707
+        },
+        {
+          "platform": "linux-arm64",
+          "packageUrl": "https://github.com/Egg-China/Aura-Rust-Runtime-Host/releases/download/v0.2.0-beta.1/dev.hmclce.runtime.rust-host-v0.2.0-beta.1-linux-arm64.npl",
+          "sha256": "ff248b1904d9f8861ec038778e7eff64806c1c948a5d56f57087ee420beb7806",
+          "size": 536386
+        },
+        {
+          "platform": "macos-x64",
+          "packageUrl": "https://github.com/Egg-China/Aura-Rust-Runtime-Host/releases/download/v0.2.0-beta.1/dev.hmclce.runtime.rust-host-v0.2.0-beta.1-macos-x64.npl",
+          "sha256": "30dbe500d48ceb978232248e41afc34e96452f51b998d0baf10fb3b0d5b75357",
+          "size": 495808
+        },
+        {
+          "platform": "macos-arm64",
+          "packageUrl": "https://github.com/Egg-China/Aura-Rust-Runtime-Host/releases/download/v0.2.0-beta.1/dev.hmclce.runtime.rust-host-v0.2.0-beta.1-macos-arm64.npl",
+          "sha256": "ce3bc32de53ab71fdeaed1e9fba4514eb62f55d8f24d046434008744f27cfb07",
+          "size": 483994
+        }
+      ],
+      "releaseNotes": "Aura 27.1 beta using the shared RuntimeProcessSession for isolated process execution.",
+      "releaseDate": "2026-08-28"
     }
   ]
 }
