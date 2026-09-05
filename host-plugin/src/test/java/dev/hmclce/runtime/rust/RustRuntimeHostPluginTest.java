@@ -324,8 +324,8 @@ final class RustRuntimeHostPluginTest {
         RuntimeProvider provider = new RustRuntimeProvider(
                 manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
         RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
-        RuntimePayloadHandle handle = new RuntimePayloadHandle(
-                "dev.hmclce.test.rust-payload", manifest.getId(), "native-41");
+        RuntimePayloadHandle handle = provider.loadPayload(
+                routingContext("dev.hmclce.test.rust-payload", PluginExecutionMode.EMBEDDED));
         PluginCapabilityToken token = hookToken();
         PluginHookEvent event = hookEvent();
 
@@ -356,8 +356,8 @@ final class RustRuntimeHostPluginTest {
         RuntimeProvider provider = new RustRuntimeProvider(
                 manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
         RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
-        RuntimePayloadHandle handle = new RuntimePayloadHandle(
-                "dev.hmclce.test.rust-payload", manifest.getId(), "native-41");
+        RuntimePayloadHandle handle = provider.loadPayload(
+                routingContext("dev.hmclce.test.rust-payload", PluginExecutionMode.EMBEDDED));
         PluginCapabilityToken token = hookToken();
         PluginHookEvent event = hookEvent();
 
@@ -407,8 +407,8 @@ final class RustRuntimeHostPluginTest {
         RuntimeProvider provider = new RustRuntimeProvider(
                 manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
         RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
-        RuntimePayloadHandle handle = new RuntimePayloadHandle(
-                "dev.hmclce.test.rust-payload", manifest.getId(), "native-41");
+        RuntimePayloadHandle handle = provider.loadPayload(
+                routingContext("dev.hmclce.test.rust-payload", PluginExecutionMode.EMBEDDED));
         PluginHookEvent event = hookEvent();
 
         assertThrows(NullPointerException.class,
@@ -422,6 +422,25 @@ final class RustRuntimeHostPluginTest {
         assertThrows(IOException.class,
                 () -> invoker.invokeHook(foreign, hookToken(), event, Duration.ofSeconds(1)));
         assertNull(engine.invokedOperation);
+    }
+
+    /// Hook dispatch must propagate an exact native transport failure without wrapping or translation.
+    @Test
+    void propagatesHookTransportIOExceptionUnchanged() throws Exception {
+        PluginManifest manifest = readManifest();
+        FakeEngine engine = new FakeEngine();
+        RuntimeProvider provider = new RustRuntimeProvider(
+                manifest.getId(), manifest.getVersion(), manifest.getProvidesRuntimes(), engine);
+        RuntimePayloadHandle handle = provider.loadPayload(
+                routingContext("dev.hmclce.test.rust-transport-payload", PluginExecutionMode.EMBEDDED));
+        RuntimeProvider.HookInvoker invoker = assertInstanceOf(RuntimeProvider.HookInvoker.class, provider);
+        IOException expected = new IOException("native transport failure");
+        engine.invocationFailure = expected;
+
+        IOException actual = assertThrows(IOException.class,
+                () -> invoker.invokeHook(handle, hookToken(), hookEvent(), Duration.ofSeconds(1L)));
+
+        assertSame(expected, actual);
     }
 
     /// JNI Bridge callbacks must resolve only the Java context mapped to their opaque Host session.
@@ -546,7 +565,6 @@ final class RustRuntimeHostPluginTest {
         assumeTrue(nativeArtifact != null && fixtureArtifact != null,
                 "Set native Host and embedded fixture artifacts to run JNI integration");
         PluginPlatformTarget platform = PluginPlatformTarget.current();
-        assumeTrue(platform.getId().startsWith("windows-"), "Current integration fixture targets Windows");
 
         Path integrationRoot = Path.of(
                 System.getProperty("hmcl.host.projectDir"),
@@ -862,6 +880,9 @@ final class RustRuntimeHostPluginTest {
         /// Optional scripted result returned by the next and subsequent generic invocations.
         private byte @Nullable [] invocationResult;
 
+        /// Optional exact transport failure thrown by the next and subsequent generic invocations.
+        private @Nullable IOException invocationFailure;
+
         /// Records engine initialization.
         @Override
         public void initialize() {
@@ -896,12 +917,16 @@ final class RustRuntimeHostPluginTest {
 
         /// Records raw-byte payload invocations and returns the configured result or an input echo.
         @Override
-        public byte[] invokePayload(String payloadId, String operation, byte[] input, long callbackId) {
+        public byte[] invokePayload(String payloadId, String operation, byte[] input, long callbackId)
+                throws IOException {
             payloadEvents.add("invoke:" + payloadId + ":" + operation + ":" + callbackId);
             invokedPayloadId = payloadId;
             invokedOperation = operation;
             invokedInput = input.clone();
             invokedCallbackId = callbackId;
+            if (invocationFailure != null) {
+                throw invocationFailure;
+            }
             return invocationResult == null ? input.clone() : invocationResult.clone();
         }
 
@@ -913,7 +938,7 @@ final class RustRuntimeHostPluginTest {
                 byte[] input,
                 long callbackId,
                 Duration timeout
-        ) {
+        ) throws IOException {
             invokedTimeout = timeout;
             return invokePayload(payloadId, operation, input, callbackId);
         }

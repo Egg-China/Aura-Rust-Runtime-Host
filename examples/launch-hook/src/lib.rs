@@ -12,6 +12,15 @@ impl Plugin for RustLaunchHookPlugin {
         input: Value,
         _callback: HmclCallbackId,
     ) -> Result<Value, Error> {
+        if operation == "aura.patch.v1" {
+            if !is_patch_invocation(&input) {
+                return Err(Error::new(ErrorCode::InvalidArgument));
+            }
+            return Ok(Value::Map(vec![
+                ("schemaVersion".into(), Value::Integer(1)),
+                ("action".into(), Value::String("unchanged".into())),
+            ]));
+        }
         if operation != "hook.before-game-launch" || !is_launch_event(&input) {
             return Err(Error::new(ErrorCode::InvalidArgument));
         }
@@ -20,6 +29,13 @@ impl Plugin for RustLaunchHookPlugin {
             ("action".into(), Value::String("unchanged".into())),
         ]))
     }
+}
+
+fn is_patch_invocation(input: &Value) -> bool {
+    let Value::Map(fields) = input else {
+        return false;
+    };
+    matches!(field(fields, "schemaVersion"), Some(Value::Integer(1)))
 }
 
 fn is_launch_event(input: &Value) -> bool {

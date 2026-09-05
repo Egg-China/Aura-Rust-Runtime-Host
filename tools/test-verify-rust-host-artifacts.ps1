@@ -1,3 +1,12 @@
+[CmdletBinding()]
+param(
+    [ValidateSet('windows-x64', 'windows-arm64', 'linux-x64', 'linux-arm64', 'macos-x64', 'macos-arm64')]
+    [string]$ActualPlatform = 'windows-x64',
+    [string]$ActualPackage = 'host-plugin/build/npl/dev.hmclce.runtime.rust-host-v0.2.0-beta.1.npl',
+    [string]$ActualNative = 'target/release/hmcl_rust_host_native.dll',
+    [string]$ActualProcess = 'target/release/hmcl-rust-host-process.exe'
+)
+
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -22,6 +31,28 @@ function Assert-Fails([scriptblock]$Action, [string]$ExpectedMessage) {
 function New-Artifact([string]$Root, [string]$Name, [byte]$Marker) {
     $path = Join-Path $Root $Name
     [System.IO.File]::WriteAllBytes($path, [byte[]]($Marker, 0x4d, 0x43, 0x4c))
+    return $path
+}
+
+function New-HostManifest([string]$Root, [string]$Platform, [string[]]$Features) {
+    $manifest = [ordered]@{
+        schemaVersion = 5
+        id = 'dev.hmclce.runtime.rust-host'
+        runtime = 'java'
+        platforms = @($Platform)
+        entrypoint = 'dev.hmclce.runtime.rust.RustRuntimeHostPlugin'
+        permissions = @('native-code')
+        requiredPermissions = @('native-code')
+        providesRuntimes = @([ordered]@{
+            runtime = 'rust'
+            abis = @(1)
+            bridgeAbi = 1
+            executionModes = @('embedded', 'isolated')
+            features = $Features
+        })
+    }
+    $path = Join-Path $Root 'plugin.json'
+    [System.IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
     return $path
 }
 
@@ -65,7 +96,9 @@ try {
         [void](New-Item -ItemType Directory -Path $fixture)
         $native = New-Artifact $fixture $target[1] 0x4e
         $process = New-Artifact $fixture $target[2] 0x50
+        $manifest = New-HostManifest $fixture $platform @('bridge', 'hooks', 'patches', 'native')
         $entries = @{
+            'plugin.json' = $manifest
             "native/$platform/$($target[1])" = $native
             "native/$platform/$($target[2])" = $process
         }
@@ -97,7 +130,9 @@ try {
     [void](New-Item -ItemType Directory -Path $windows)
     $native = New-Artifact $windows 'hmcl_rust_host_native.dll' 0x61
     $process = New-Artifact $windows 'hmcl-rust-host-process.exe' 0x62
+    $manifest = New-HostManifest $windows 'windows-x64' @('bridge', 'hooks', 'patches', 'native')
     $validEntries = @{
+        'plugin.json' = $manifest
         'native/windows-x64/hmcl_rust_host_native.dll' = $native
         'native/windows-x64/hmcl-rust-host-process.exe' = $process
     }
@@ -121,6 +156,7 @@ try {
     } 'Process Host for windows-x64 must be named hmcl-rust-host-process.exe'
 
     $missingNativePackage = New-Package $windows 'missing-native' @{
+        'plugin.json' = $manifest
         'native/windows-x64/hmcl-rust-host-process.exe' = $process
     }
     Assert-Fails {
@@ -129,6 +165,7 @@ try {
     } 'NPL is missing native library entry'
 
     $missingProcessPackage = New-Package $windows 'missing-process' @{
+        'plugin.json' = $manifest
         'native/windows-x64/hmcl_rust_host_native.dll' = $native
     }
     Assert-Fails {
@@ -138,6 +175,7 @@ try {
 
     $differentProcess = New-Artifact $windows 'different-process.exe' 0x65
     $mismatchedPackage = New-Package $windows 'mismatched-bytes' @{
+        'plugin.json' = $manifest
         'native/windows-x64/hmcl_rust_host_native.dll' = $native
         'native/windows-x64/hmcl-rust-host-process.exe' = $differentProcess
     }
@@ -147,6 +185,7 @@ try {
     } 'NPL process Host bytes do not match the input artifact'
 
     $duplicatePlatformPackage = New-Package $windows 'duplicate-platform' @{
+        'plugin.json' = $manifest
         'native/windows-x64/hmcl_rust_host_native.dll' = $native
         'native/windows-x64/hmcl-rust-host-process.exe' = $process
         'native/linux-x64/unexpected.bin' = $native
@@ -155,6 +194,116 @@ try {
         & $verifier -Platform windows-x64 -NativeLibrary $native `
             -ProcessHost $process -Package $duplicatePlatformPackage
     } 'NPL must contain exactly one native platform output'
+
+    foreach ($requiredFeature in @('bridge', 'hooks', 'patches', 'native')) {
+        $features = @('bridge', 'hooks', 'patches', 'native') | Where-Object { $_ -cne $requiredFeature }
+        $missingFeatureManifest = New-HostManifest $windows 'windows-x64' $features
+        $missingFeaturePackage = New-Package $windows "missing-feature-$requiredFeature" @{
+            'plugin.json' = $missingFeatureManifest
+            'native/windows-x64/hmcl_rust_host_native.dll' = $native
+            'native/windows-x64/hmcl-rust-host-process.exe' = $process
+        }
+        Assert-Fails {
+            & $verifier -Platform windows-x64 -NativeLibrary $native `
+                -ProcessHost $process -Package $missingFeaturePackage
+        } "Rust Host manifest is missing required feature: $requiredFeature"
+    }
+
+    $wrongSchemaManifest = New-HostManifest $windows 'windows-x64' @('bridge', 'hooks', 'patches', 'native')
+    $wrongSchema = Get-Content -LiteralPath $wrongSchemaManifest -Raw | ConvertFrom-Json
+    $wrongSchema.schemaVersion = 4
+    $wrongSchema | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $wrongSchemaManifest -NoNewline
+    $wrongSchemaPackage = New-Package $windows 'wrong-schema' @{
+        'plugin.json' = $wrongSchemaManifest
+        'native/windows-x64/hmcl_rust_host_native.dll' = $native
+        'native/windows-x64/hmcl-rust-host-process.exe' = $process
+    }
+    Assert-Fails {
+        & $verifier -Platform windows-x64 -NativeLibrary $native `
+            -ProcessHost $process -Package $wrongSchemaPackage
+    } 'Rust Host manifest must use schemaVersion 5'
+
+    $wrongEntrypointManifest = New-HostManifest $windows 'windows-x64' @('bridge', 'hooks', 'patches', 'native')
+    (Get-Content -LiteralPath $wrongEntrypointManifest -Raw).Replace(
+        'dev.hmclce.runtime.rust.RustRuntimeHostPlugin', 'wrong.Entrypoint') |
+        Set-Content -LiteralPath $wrongEntrypointManifest -NoNewline
+    $wrongEntrypointPackage = New-Package $windows 'wrong-entrypoint' @{
+        'plugin.json' = $wrongEntrypointManifest
+        'native/windows-x64/hmcl_rust_host_native.dll' = $native
+        'native/windows-x64/hmcl-rust-host-process.exe' = $process
+    }
+    Assert-Fails {
+        & $verifier -Platform windows-x64 -NativeLibrary $native `
+            -ProcessHost $process -Package $wrongEntrypointPackage
+    } 'Rust Host manifest entrypoint is invalid'
+
+    $corruptPackage = Join-Path $windows 'corrupt.npl'
+    [System.IO.File]::WriteAllBytes($corruptPackage, [byte[]](0x00, 0x01, 0x02))
+    Assert-Fails {
+        & $verifier -Platform windows-x64 -NativeLibrary $native `
+            -ProcessHost $process -Package $corruptPackage
+    } 'NPL archive cannot be opened'
+
+    Assert-Condition (Test-Path -LiteralPath $ActualPackage -PathType Leaf) `
+        "Build the actual Host NPL before verifier tests: $ActualPackage"
+    Assert-Condition (Test-Path -LiteralPath $ActualNative -PathType Leaf) `
+        "Build the actual Host native library before verifier tests: $ActualNative"
+    Assert-Condition (Test-Path -LiteralPath $ActualProcess -PathType Leaf) `
+        "Build the actual Host process before verifier tests: $ActualProcess"
+    $actualRoot = Join-Path $temporary 'actual-host'
+    [void](New-Item -ItemType Directory -Path $actualRoot)
+
+    function New-ActualManifestMutation([string]$Name, [scriptblock]$Mutation) {
+        $copy = Join-Path $actualRoot "$Name.npl"
+        Copy-Item -LiteralPath $ActualPackage -Destination $copy
+        $updatedArchive = [System.IO.Compression.ZipFile]::Open(
+            $copy, [System.IO.Compression.ZipArchiveMode]::Update)
+        try {
+            $entry = $updatedArchive.GetEntry('plugin.json')
+            $reader = [System.IO.StreamReader]::new($entry.Open())
+            try { $actualManifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+            & $Mutation $actualManifest
+            $entry.Delete()
+            $replacement = $updatedArchive.CreateEntry('plugin.json')
+            $writer = [System.IO.StreamWriter]::new($replacement.Open(), [System.Text.UTF8Encoding]::new($false))
+            $actualManifestJson = $actualManifest | ConvertTo-Json -Depth 8
+            try { $writer.Write($actualManifestJson) } finally { $writer.Dispose() }
+        } finally {
+            $updatedArchive.Dispose()
+        }
+        return $copy
+    }
+
+    foreach ($requiredFeature in @('bridge', 'hooks', 'patches', 'native')) {
+        $actualFeature = New-ActualManifestMutation "actual-missing-$requiredFeature" {
+            param($manifest)
+            $manifest.providesRuntimes[0].features = @($manifest.providesRuntimes[0].features | Where-Object { $_ -cne $requiredFeature })
+        }
+        Assert-Fails {
+            & $verifier -Platform $ActualPlatform -NativeLibrary $ActualNative `
+                -ProcessHost $ActualProcess -Package $actualFeature
+        } "Rust Host manifest is missing required feature: $requiredFeature"
+    }
+
+    $actualSchema = New-ActualManifestMutation 'actual-wrong-schema' { param($manifest) $manifest.schemaVersion = 4 }
+    Assert-Fails {
+        & $verifier -Platform $ActualPlatform -NativeLibrary $ActualNative `
+            -ProcessHost $ActualProcess -Package $actualSchema
+    } 'Rust Host manifest must use schemaVersion 5'
+
+    $actualEntrypoint = New-ActualManifestMutation 'actual-wrong-entrypoint' { param($manifest) $manifest.entrypoint = 'wrong.Entrypoint' }
+    Assert-Fails {
+        & $verifier -Platform $ActualPlatform -NativeLibrary $ActualNative `
+            -ProcessHost $ActualProcess -Package $actualEntrypoint
+    } 'Rust Host manifest entrypoint is invalid'
+
+    $actualCorrupt = Join-Path $actualRoot 'actual-corrupt.npl'
+    Copy-Item -LiteralPath $ActualPackage -Destination $actualCorrupt
+    [System.IO.File]::WriteAllBytes($actualCorrupt, [byte[]](0x00, 0x01, 0x02))
+    Assert-Fails {
+        & $verifier -Platform $ActualPlatform -NativeLibrary $ActualNative `
+            -ProcessHost $ActualProcess -Package $actualCorrupt
+    } 'NPL archive cannot be opened'
 
     Write-Host 'Rust Host artifact verifier tests passed.'
 } finally {

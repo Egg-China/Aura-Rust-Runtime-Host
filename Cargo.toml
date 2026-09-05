@@ -5,6 +5,7 @@ members = [
     "crates/hmcl-plugin-sdk",
     "crates/hmcl-rust-host-process",
     "crates/hmcl-rust-host-native",
+    "examples/launch-hook",
 ]
 exclude = ["crates/hmcl-rust-host-native/tests/fixtures"]
 resolver = "3"

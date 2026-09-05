@@ -58,8 +58,45 @@ Assert-Condition ($processName -ceq $expectedProcessName) `
 Assert-Condition ($resolvedPackage.EndsWith('.npl', [System.StringComparison]::OrdinalIgnoreCase)) `
     'Rust Host package must use the .npl extension'
 
-$archive = [System.IO.Compression.ZipFile]::OpenRead($resolvedPackage)
+$archive = $null
 try {
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($resolvedPackage)
+    } catch {
+        throw "NPL archive cannot be opened: $($_.Exception.Message)"
+    }
+    $manifestEntry = $archive.GetEntry('plugin.json')
+    Assert-Condition ($null -ne $manifestEntry) 'NPL is missing plugin.json'
+    try {
+        $manifestReader = [System.IO.StreamReader]::new($manifestEntry.Open())
+        try {
+            $manifest = $manifestReader.ReadToEnd() | ConvertFrom-Json
+        } finally {
+            $manifestReader.Dispose()
+        }
+    } catch {
+        throw "Rust Host manifest is not valid JSON: $($_.Exception.Message)"
+    }
+    Assert-Condition ($manifest.schemaVersion -eq 5) 'Rust Host manifest must use schemaVersion 5'
+    Assert-Condition ($manifest.id -ceq 'dev.hmclce.runtime.rust-host') 'Rust Host manifest ID is invalid'
+    Assert-Condition ($manifest.entrypoint -ceq 'dev.hmclce.runtime.rust.RustRuntimeHostPlugin') `
+        'Rust Host manifest entrypoint is invalid'
+    Assert-Condition ((@($manifest.platforms) -join ',') -ceq $Platform) `
+        'Rust Host manifest platforms must contain only the packaged platform'
+    $runtimeDeclarations = @($manifest.providesRuntimes | Where-Object { $_.runtime -ceq 'rust' })
+    Assert-Condition ($runtimeDeclarations.Count -eq 1) 'Rust Host manifest must declare exactly one Rust runtime'
+    $runtime = $runtimeDeclarations[0]
+    Assert-Condition ((@($runtime.abis) -join ',') -ceq '1' -and $runtime.bridgeAbi -eq 1) `
+        'Rust Host manifest ABI declarations are invalid'
+    Assert-Condition ((@($runtime.executionModes) -join ',') -ceq 'embedded,isolated') `
+        'Rust Host manifest execution modes are invalid'
+    foreach ($requiredFeature in @('bridge', 'hooks', 'patches', 'native')) {
+        Assert-Condition (@($runtime.features) -ccontains $requiredFeature) `
+            "Rust Host manifest is missing required feature: $requiredFeature"
+    }
+    Assert-Condition ((@($runtime.features) -join ',') -ceq 'bridge,hooks,patches,native') `
+        'Rust Host manifest features must be bridge, hooks, patches, native'
+
     $nativePlatforms = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::Ordinal
     )
@@ -94,7 +131,9 @@ try {
         $processStream.Dispose()
     }
 } finally {
-    $archive.Dispose()
+    if ($null -ne $archive) {
+        $archive.Dispose()
+    }
 }
 
 $nativeHash = (Get-FileHash -LiteralPath $resolvedNative -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -1,10 +1,10 @@
 {
   "schemaVersion": 5,
   "id": "dev.hmclce.example.rust.launch-hook",
-  "name": "Rust Game Launch Hook Plugin",
+  "name": "Aura Rust Game Launch Hook Plugin",
   "version": "1.0.0",
-  "description": "Isolated Rust example that observes the before-game-launch Hook.",
-  "author": "HMCL CE Community",
+  "description": "Aura Rust example that observes the before-game-launch Hook and FileUtils.getName after Patch.",
+  "author": "Aura Launcher Community",
   "type": "java",
   "runtime": "rust",
   "abi": 1,
@@ -16,14 +16,25 @@
   "runtimeProvider": "dev.hmclce.runtime.rust-host",
   "dependencies": [],
   "permissions": [
-    "launcher-hook"
+    "launcher-hook",
+    "launcher-patch"
   ],
   "requiredPermissions": [
-    "launcher-hook"
+    "launcher-hook",
+    "launcher-patch"
   ],
   "hooks": [
     "before-game-launch"
   ],
-  "patches": [],
+  "patches": [
+    {
+      "target": "org.jackhuang.hmcl.util.io.FileUtils",
+      "method": "getName",
+      "type": "after",
+      "parameters": [
+        "java.nio.file.Path"
+      ]
+    }
+  ],
   "launcherVersion": ">=27.1-0-next"
 }

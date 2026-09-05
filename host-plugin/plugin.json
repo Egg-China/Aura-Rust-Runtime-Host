@@ -41,6 +41,7 @@
       "features": [
         "bridge",
         "hooks",
+        "patches",
         "native"
       ]
     }

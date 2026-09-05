@@ -1,9 +1,10 @@
 use hmcl_plugin_sdk::{HandleValue, Value};
 use hmcl_runtime_protocol::{Message, MessageBody, read_frame, write_frame};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[test]
 fn probe_exits_successfully_without_protocol_input() {
@@ -67,6 +68,96 @@ fn isolated_payload_runs_complete_lifecycle_and_bridge_calls() {
         vec!["initialize", "fixture.bridge", "shutdown"]
     );
     client.finish();
+}
+
+#[test]
+fn launch_hook_sample_returns_literal_unchanged_hook_and_patch_responses() {
+    let sample = launch_hook_sample();
+    let mut client = ProcessClient::start();
+
+    assert_eq!(
+        client.request_with_id(1, MessageBody::Hello),
+        MessageBody::Ok
+    );
+    assert_eq!(
+        client.request_with_id(
+            3,
+            MessageBody::Load {
+                package_root: sample.root.to_string_lossy().into_owned(),
+                entrypoint: sample
+                    .library
+                    .file_name()
+                    .expect("launch-hook library filename")
+                    .to_string_lossy()
+                    .into_owned(),
+                plugin_id: 71,
+                session: 73,
+            }
+        ),
+        MessageBody::Ok
+    );
+    assert_eq!(
+        client.request_with_id(5, MessageBody::Enable),
+        MessageBody::Ok
+    );
+    assert_eq!(
+        client.request_with_id(
+            7,
+            MessageBody::Invoke {
+                operation: "hook.before-game-launch".into(),
+                input: launch_hook_input(),
+                callback_id: 0,
+            }
+        ),
+        MessageBody::Result {
+            output: literal_unchanged_hook_wire(),
+        }
+    );
+    assert_eq!(
+        client.request_with_id(
+            9,
+            MessageBody::Invoke {
+                operation: "aura.patch.v1".into(),
+                input: literal_patch_request_wire(),
+                callback_id: 0,
+            }
+        ),
+        MessageBody::Result {
+            output: literal_unchanged_patch_wire(),
+        }
+    );
+    assert_eq!(
+        client.request_with_id(11, MessageBody::Disable),
+        MessageBody::Ok
+    );
+    assert_eq!(
+        client.request_with_id(13, MessageBody::Shutdown),
+        MessageBody::Ok
+    );
+    client.assert_no_extra_stdout();
+    client.finish();
+}
+
+#[test]
+fn incomplete_open_launch_hook_frame_times_out_then_is_killed_and_reaped() {
+    let mut child = BoundedChild::start();
+    let mut input = child.take_stdin();
+    input
+        .write_all(&[0, 0, 0, 2, 0x92])
+        .expect("write incomplete frame");
+    input.flush().expect("flush incomplete frame");
+
+    assert!(
+        child
+            .wait_for_exit_until(Instant::now() + Duration::from_millis(250))
+            .is_none(),
+        "process Host unexpectedly exited before the parent incomplete-frame timeout"
+    );
+    let status = child.kill_and_reap_within(Instant::now() + Duration::from_secs(2));
+    assert!(
+        !status.success(),
+        "killed incomplete-frame process Host must not report success"
+    );
 }
 
 #[test]
@@ -270,6 +361,22 @@ impl ProcessClient {
         }
     }
 
+    fn request_with_id(&mut self, expected_request_id: u64, body: MessageBody) -> MessageBody {
+        assert_eq!(self.next_request_id, expected_request_id);
+        self.request(body)
+    }
+
+    fn assert_no_extra_stdout(&mut self) {
+        let mut trailing = Vec::new();
+        self.output
+            .read_to_end(&mut trailing)
+            .expect("read remaining process stdout");
+        assert!(
+            trailing.is_empty(),
+            "process Host emitted unexpected stdout: {trailing:?}"
+        );
+    }
+
     fn answer_callback(&mut self, message: Message) {
         let response_body = match message.body() {
             MessageBody::BridgeInvoke { operation, input } => {
@@ -335,6 +442,52 @@ impl Drop for ProcessClient {
     }
 }
 
+struct BoundedChild {
+    child: Child,
+}
+
+impl BoundedChild {
+    fn start() -> Self {
+        Self {
+            child: spawn_process(),
+        }
+    }
+
+    fn take_stdin(&mut self) -> ChildStdin {
+        self.child.stdin.take().expect("bounded child stdin")
+    }
+
+    fn wait_for_exit_until(&mut self, deadline: Instant) -> Option<ExitStatus> {
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll bounded child") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_and_reap_within(&mut self, deadline: Instant) -> ExitStatus {
+        if let Some(status) = self.child.try_wait().expect("poll child before kill") {
+            return status;
+        }
+        self.child.kill().expect("kill timed-out process Host");
+        self.wait_for_exit_until(deadline)
+            .expect("process Host did not reap within the parent timeout after kill")
+    }
+}
+
+impl Drop for BoundedChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.wait_for_exit_until(Instant::now() + Duration::from_secs(2));
+        }
+    }
+}
+
 struct FixtureArtifacts {
     root: PathBuf,
     valid: PathBuf,
@@ -342,9 +495,19 @@ struct FixtureArtifacts {
     wrong_abi: PathBuf,
 }
 
+struct LaunchHookSample {
+    root: PathBuf,
+    library: PathBuf,
+}
+
 fn fixtures() -> &'static FixtureArtifacts {
     static ARTIFACTS: OnceLock<FixtureArtifacts> = OnceLock::new();
     ARTIFACTS.get_or_init(build_fixtures)
+}
+
+fn launch_hook_sample() -> &'static LaunchHookSample {
+    static SAMPLE: OnceLock<LaunchHookSample> = OnceLock::new();
+    SAMPLE.get_or_init(build_launch_hook_sample)
 }
 
 fn build_fixtures() -> FixtureArtifacts {
@@ -371,6 +534,76 @@ fn build_fixtures() -> FixtureArtifacts {
         missing: artifact("hmcl_missing_query_fixture"),
         wrong_abi: artifact("hmcl_wrong_abi_fixture"),
     }
+}
+
+fn build_launch_hook_sample() -> LaunchHookSample {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let target = repository.join("target").join("launch-hook-test");
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "--package", "hmcl-rust-launch-hook", "--locked"])
+        .current_dir(&repository)
+        .env("CARGO_TARGET_DIR", &target)
+        .status()
+        .expect("build Rust launch-hook sample");
+    assert!(status.success(), "launch-hook sample build failed");
+    let library = target.join("debug").join(format!(
+        "{}hmcl_rust_launch_hook.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    ));
+    LaunchHookSample {
+        root: library
+            .parent()
+            .expect("launch-hook library parent")
+            .to_path_buf(),
+        library,
+    }
+}
+
+fn launch_hook_input() -> Vec<u8> {
+    Value::Map(vec![
+        ("contractVersion".into(), Value::Integer(1)),
+        (
+            "dispatchId".into(),
+            Value::String("rust-stdio-hook-71".into()),
+        ),
+        ("point".into(), Value::String("before-game-launch".into())),
+        (
+            "occurredAt".into(),
+            Value::String("2026-09-05T00:00:00Z".into()),
+        ),
+        ("data".into(), Value::Map(Vec::new())),
+    ])
+    .to_wire()
+    .expect("encode launch Hook input")
+}
+
+fn literal_patch_request_wire() -> Vec<u8> {
+    vec![
+        0x92, 0x07, 0xdd, 0x00, 0x00, 0x00, 0x01, 0x92, 0xdb, 0x00, 0x00, 0x00, 0x0d, b's', b'c',
+        b'h', b'e', b'm', b'a', b'V', b'e', b'r', b's', b'i', b'o', b'n', 0x92, 0x02, 0xd3, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    ]
+}
+
+fn literal_unchanged_hook_wire() -> Vec<u8> {
+    vec![
+        0x92, 0x07, 0xdd, 0x00, 0x00, 0x00, 0x02, 0x92, 0xdb, 0x00, 0x00, 0x00, 0x0f, b'c', b'o',
+        b'n', b't', b'r', b'a', b'c', b't', b'V', b'e', b'r', b's', b'i', b'o', b'n', 0x92, 0x02,
+        0xd3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x92, 0xdb, 0x00, 0x00, 0x00, 0x06,
+        b'a', b'c', b't', b'i', b'o', b'n', 0x92, 0x04, 0xdb, 0x00, 0x00, 0x00, 0x09, b'u', b'n',
+        b'c', b'h', b'a', b'n', b'g', b'e', b'd',
+    ]
+}
+
+fn literal_unchanged_patch_wire() -> Vec<u8> {
+    vec![
+        0x92, 0x07, 0xdd, 0x00, 0x00, 0x00, 0x02, 0x92, 0xdb, 0x00, 0x00, 0x00, 0x0d, b's', b'c',
+        b'h', b'e', b'm', b'a', b'V', b'e', b'r', b's', b'i', b'o', b'n', 0x92, 0x02, 0xd3, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x92, 0xdb, 0x00, 0x00, 0x00, 0x06, b'a', b'c',
+        b't', b'i', b'o', b'n', 0x92, 0x04, 0xdb, 0x00, 0x00, 0x00, 0x09, b'u', b'n', b'c', b'h',
+        b'a', b'n', b'g', b'e', b'd',
+    ]
 }
 
 fn spawn_process() -> Child {

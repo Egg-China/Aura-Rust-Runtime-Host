@@ -1,58 +1,36 @@
-# Isolated Rust Launch Hook
+# Aura Rust launch-hook example
 
-此示例是 schema-v5 Rust payload。它由单独安装的
-`dev.hmclce.runtime.rust-host` 插件启动，每个 payload 使用一个
-`hmcl-rust-host-process` 子进程。示例接收 `before-game-launch` Hook，验证
-Bridge Value v1 事件字段，并返回严格的 `unchanged` 结果。
+This source example is a schema-v5 Rust payload for the optional
+`dev.hmclce.runtime.rust-host` provider. It observes the `before-game-launch` Hook and the
+after Patch for `org.jackhuang.hmcl.util.io.FileUtils.getName(java.nio.file.Path)`. Both handlers
+return `unchanged`; the Patch does not modify arguments or the target result.
 
-## 构建 Windows x64 NPL
+The payload declares `launcher-hook` and `launcher-patch` in both permission lists. Grant these
+permissions only to an exact reviewed NPL. Aura can revoke its callbacks when the payload is
+disabled, unloaded, replaced, or loses permission.
+
+## Build and package
+
+Build the library for the current Windows x64 development host and create a reproducible NPL:
 
 ```powershell
-cargo build --manifest-path examples/rust-launch-hook/Cargo.toml --release
-$stage = Join-Path $env:TEMP ('hmcl-rust-launch-hook-npl-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force "$stage/payload" | Out-Null
-Copy-Item examples/rust-launch-hook/plugin.json "$stage/plugin.json"
-Copy-Item examples/rust-launch-hook/target/release/hmcl_rust_launch_hook.dll `
-    "$stage/payload/hmcl_rust_launch_hook.dll"
-$package = "$stage/dev.hmclce.example.rust.launch-hook-v1.0.0.npl"
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$archive = [System.IO.Compression.ZipFile]::Open(
-    $package,
-    [System.IO.Compression.ZipArchiveMode]::Create
-)
-try {
-    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-        $archive, "$stage/plugin.json", 'plugin.json') | Out-Null
-    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-        $archive,
-        "$stage/payload/hmcl_rust_launch_hook.dll",
-        'payload/hmcl_rust_launch_hook.dll'
-    ) | Out-Null
-} finally {
-    $archive.Dispose()
-}
-./tools/validate-npl.ps1 -Package $package
+cargo build --manifest-path examples/launch-hook/Cargo.toml --release --locked
+./tools/package-rust-launch-hook.ps1 `
+  -Platform windows-x64 `
+  -Library target/release/hmcl_rust_launch_hook.dll `
+  -Output artifacts/dev.hmclce.example.rust.launch-hook-v1.0.0-windows-x64.npl
+./.ci/sdk/tools/validate-npl.ps1 `
+  -Package artifacts/dev.hmclce.example.rust.launch-hook-v1.0.0-windows-x64.npl
 ```
 
-先安装与当前平台匹配的 Rust Runtime Host NPL，再安装示例 NPL。Host 是可选插件，
-不会被打进 Aura Launcher，也不会被打进此 payload 包。
+For CI or another target, pass the matching Cargo target output and platform. The generated
+manifest contains exactly that platform and its matching entrypoint: `.dll` on Windows, `.so` on
+Linux, and `.dylib` on macOS.
 
-Schema v5 当前保留 legacy `type` 字段，所以清单仍写 `type: "java"`；它不加载 Java 类，
-也不把 Rust 类型绑定到 JVM。`runtime: "rust"`、ABI 1、`executionMode: "isolated"` 和
-`runtimeProvider` 才决定实际 Host、ABI 与进程边界。固定 Provider 会参与 Launcher 的运行时
-依赖规划，因此 `dependencies` 不需要重复列出 Host 插件 ID。
+## Runtime boundary
 
-## 其他平台
+The isolated child process receives canonical Hook/Patch envelopes, operation names, and Bridge
+Value v1 bytes. JVM `PluginCapabilityToken` values never cross the process boundary. Aura retains
+the capability token and reauthorizes every callback against the original payload context.
 
-每个平台发布独立 NPL，并同步修改 `platforms` 与 `entrypoint`：
-
-| 平台 | Cargo payload 文件 | NPL entrypoint |
-| --- | --- | --- |
-| Windows x64/ARM64 | `hmcl_rust_launch_hook.dll` | `payload/hmcl_rust_launch_hook.dll` |
-| Linux x64/ARM64 | `libhmcl_rust_launch_hook.so` | `payload/libhmcl_rust_launch_hook.so` |
-| macOS x64/ARM64 | `libhmcl_rust_launch_hook.dylib` | `payload/libhmcl_rust_launch_hook.dylib` |
-
-Java 的 `PluginCapabilityToken` 不会序列化到子进程。子进程只收到协议 request ID、
-payload 路径、操作名和 Bridge Value v1 字节；每次 Bridge 回调都由 Launcher 依据原始
-payload context 重新执行权限检查。
+This is current source, not a claim that existing beta downloads include the Hook/Patch changes.
